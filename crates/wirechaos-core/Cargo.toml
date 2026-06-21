@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 tokio = { workspace = true, features = ["net", "io-util", "time", "sync"] }
 tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 serde.workspace = true
 serde_yaml.workspace = true
 anyhow.workspace = true

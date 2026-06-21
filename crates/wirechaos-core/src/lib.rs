@@ -1,3 +1,6 @@
+mod observability;
+
 pub fn init_core() {
-    tracing::info!("Hello world from wirechaos-core library!")
+    observability::init_logging();
+    tracing::info!("Core infrastructure and logging initialized.");
 }

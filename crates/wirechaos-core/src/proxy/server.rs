@@ -32,3 +32,6 @@ async fn handle_connection(mut socket: TcpStream, addr: SocketAddr) -> anyhow::R
     info!("bytes copied: {:?}", bytes_copied);
     Ok(())
 }
+
+//todo:: implement wire protocol step by step
+// first handle tls non tls

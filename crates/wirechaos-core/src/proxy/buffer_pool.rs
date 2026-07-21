@@ -1,5 +1,6 @@
 use bytes::BytesMut;
 use std::ops::{Deref, DerefMut};
+use std::ptr::null;
 use std::sync::{Arc, Mutex};
 
 pub struct PooledBytes {

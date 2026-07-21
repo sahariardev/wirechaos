@@ -1,15 +1,16 @@
+use bytes::BytesMut;
 use tokio::sync::Mutex;
 
 pub struct BufferPool {
-    buffers: Mutex<Vec<Vec<u8>>>,
+    buffers: Mutex<Vec<BytesMut>>,
 }
 
 impl BufferPool {
-    fn new(initial_capacity: usize) -> Self {
+    pub fn new(initial_capacity: usize) -> Self {
         let mut buffers = Vec::new();
 
         for _ in 0..initial_capacity {
-            buffers.push(vec![0u8; 65536]);
+            buffers.push(BytesMut::with_capacity(initial_capacity));
         }
 
         Self {
@@ -17,12 +18,24 @@ impl BufferPool {
         }
     }
 
-    async fn rent_buffer(&self) -> Vec<u8> {
-        let mut lock = self.buffers.lock().await;
-        lock.pop().unwrap_or_else(|| vec![0u8; 65536])
+    pub async fn rent_buffer(&self) -> BytesMut {
+        todo!("buffer pool rent_buffer")
     }
 
-    async fn return_buffer(&self, buf: Vec<u8>) {
+    pub async fn rent_buffer_with_size(&self, size: usize) -> BytesMut {
+        let mut lock = self.buffers.lock().await;
+
+        if let Some(pos) = lock.iter().position(|b| b.capacity() >= size) {
+            let mut buf = lock.remove(pos);
+            buf.clear();
+            buf
+        } else {
+            BytesMut::with_capacity(size)
+        }
+    }
+
+    pub async fn return_buffer(&self, mut buf: BytesMut) {
+        buf.clear();
         let mut lock = self.buffers.lock().await;
         lock.push(buf);
     }

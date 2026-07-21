@@ -47,7 +47,8 @@ impl Conn {
         Ok(len - 4)
     }
 
-    pub async fn read_startup_packet(&mut self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    
+    pub async fn read_startup_packet(&mut self) -> Result<PooledBytes, Box<dyn std::error::Error>> {
         let length = self.read_message_length().await?;
 
         if length > MAX_STARTUP_PACKET_LENGTH as usize {
@@ -57,7 +58,16 @@ impl Conn {
             )));
         }
 
-        todo!("read startup packet")
+        let message = self.read_message_body(length).await?;
+
+        if message.is_none() {
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Message body is empty",
+            )));
+        }
+
+        Ok(message.unwrap())
     }
 
     pub async fn read_message_body(

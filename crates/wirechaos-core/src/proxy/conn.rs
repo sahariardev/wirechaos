@@ -1,16 +1,19 @@
 use crate::proxy::buffer_pool::{MultiBufferPool, PooledBytes};
+use crate::proxy::conn_read::ConnRead;
+use crate::proxy::conn_write::ConnWrite;
 use crate::proxy::packet::MessageReader;
 use std::sync::Arc;
 use tokio::io;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
+use tokio_rustls::TlsAcceptor;
 
 pub struct Conn {
-    buffer_reader: BufReader<OwnedReadHalf>,
-    buffer_writer: BufWriter<OwnedWriteHalf>,
+    buffer_reader: BufReader<ConnRead>,
+    buffer_writer: BufWriter<ConnWrite>,
     pool: Arc<MultiBufferPool>,
     ssl_done: bool,
+    tls_acceptor: Option<TlsAcceptor>,
 }
 
 const MAX_STARTUP_PACKET_LENGTH: u32 = 10000;
@@ -19,14 +22,18 @@ const SSL_REQUEST_CODE: u32 = (1234 << 16) | 5679;
 const GSSENC_REQUEST_CODE: u32 = (1234 << 16) | 5680;
 
 impl Conn {
-    pub fn new(stream: TcpStream, pool: Arc<MultiBufferPool>) -> Self {
-        let (reader, writer) = stream.into_split();
-
+    pub fn new(
+        stream: TcpStream,
+        pool: Arc<MultiBufferPool>,
+        tls_acceptor: Option<TlsAcceptor>,
+    ) -> Self {
+        let (read_half, write_half) = stream.into_split();
         Self {
-            buffer_reader: BufReader::new(reader),
-            buffer_writer: BufWriter::new(writer),
+            buffer_reader: BufReader::new(ConnRead::Plain(read_half)),
+            buffer_writer: BufWriter::new(ConnWrite::Plain(write_half)),
             pool,
             ssl_done: false,
+            tls_acceptor,
         }
     }
 
@@ -34,7 +41,7 @@ impl Conn {
         todo!("handle message")
     }
 
-    pub async fn handle_startup(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn handle_startup(mut self) -> Result<Self, Box<dyn std::error::Error>> {
         let buf = self.read_startup_packet().await?;
         let mut message_reader = MessageReader::new(buf);
         let protocol_code = message_reader.read_u32()?;
@@ -48,19 +55,33 @@ impl Conn {
                 self.ssl_done = true;
                 self.buffer_writer.write_all(b"S").await?;
                 self.buffer_writer.flush().await?;
-
-                let check = self.buffer_reader.fill_buf().await?;
-
-                if !check.is_empty() {
-                    return Err(Box::from("received unencrypted data after SSL request: possible man-in-the-middle attack"));
-                }
-                //todo:: promote connection to tls connection
-
+                
+                self = self.promote_to_tls().await?;
             }
             _ => {}
         }
 
-        todo!("handle startup")
+        Ok(self)
+    }
+
+    async fn promote_to_tls(mut self) -> Result<Self, Box<dyn std::error::Error>> {
+        let ConnRead::Plain(read_half) = self.buffer_reader.into_inner() else {
+            unreachable!("ssl_done guard prevents a double upgrade")
+        };
+
+        let ConnWrite::Plain(write_half) = self.buffer_writer.into_inner() else {
+            unreachable!("ssl_done guard prevents a double upgrade")
+        };
+
+        let tcp = read_half.reunite(write_half)?;
+        let acceptor = self.tls_acceptor.as_ref().ok_or("TLS acceptor not set")?;
+
+        let tls = acceptor.accept(tcp).await?;
+
+        let (read_half, write_half) = tokio::io::split(tls);
+        self.buffer_reader = BufReader::new(ConnRead::Tls(read_half));
+        self.buffer_writer = BufWriter::new(ConnWrite::Tls(write_half));
+        Ok(self)
     }
 
     pub async fn read_message_length(&mut self) -> Result<usize, Box<dyn std::error::Error>> {

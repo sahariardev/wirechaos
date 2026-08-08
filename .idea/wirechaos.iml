@@ -5,6 +5,7 @@
       <sourceFolder url="file://$MODULE_DIR$/crates/wirechaos-core/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/wirechaos/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/wirechaos-core/tests" isTestSource="true" />
       <excludeFolder url="file://$MODULE_DIR$/crates/wirechaos-core/target" />
       <excludeFolder url="file://$MODULE_DIR$/crates/wirechaos/target" />
       <excludeFolder url="file://$MODULE_DIR$/target" />

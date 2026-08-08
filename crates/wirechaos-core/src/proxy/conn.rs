@@ -51,12 +51,21 @@ impl Conn {
                 if self.ssl_done {
                     return Err(Box::from("SSL Request is already done"));
                 }
-                //handle ssl request code
                 self.ssl_done = true;
-                self.buffer_writer.write_all(b"S").await?;
-                self.buffer_writer.flush().await?;
-                
-                self = self.promote_to_tls().await?;
+
+                if self.tls_acceptor.is_some() {
+                    // Offer TLS: the client expects 'S' and then runs the
+                    // handshake on this socket.
+                    self.buffer_writer.write_all(b"S").await?;
+                    self.buffer_writer.flush().await?;
+
+                    self = self.promote_to_tls().await?;
+                } else {
+                    // No TLS support configured: decline and keep the
+                    // connection in plaintext.
+                    self.buffer_writer.write_all(b"N").await?;
+                    self.buffer_writer.flush().await?;
+                }
             }
             _ => {}
         }
@@ -136,5 +145,13 @@ impl Conn {
         self.buffer_reader.read_exact(&mut buf).await?;
 
         Ok(Some(buf))
+    }
+
+    /// Write raw bytes to the peer over the current transport (plain or TLS)
+    /// and flush. Used by the proxy to send protocol messages to the client.
+    pub async fn write_raw(&mut self, data: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+        self.buffer_writer.write_all(data).await?;
+        self.buffer_writer.flush().await?;
+        Ok(())
     }
 }

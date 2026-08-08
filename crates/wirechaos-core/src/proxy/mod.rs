@@ -1,7 +1,7 @@
-mod server;
-mod conn;
+pub mod server;
+pub mod conn;
 mod pool;
-mod buffer_pool;
+pub mod buffer_pool;
 mod packet;
 mod conn_read;
 mod conn_write;

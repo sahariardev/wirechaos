@@ -30,7 +30,7 @@ impl MessageReader {
     }
 
     pub fn read_u16(&mut self) -> Result<u16, Box<dyn std::error::Error>> {
-        if self.remaining() <= 2 {
+        if self.remaining() < 2 {
             return Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "Not enough bytes to read",
@@ -45,7 +45,7 @@ impl MessageReader {
     }
 
     pub fn read_u32(&mut self) -> Result<u32, Box<dyn std::error::Error>> {
-        if self.remaining() <= 4 {
+        if self.remaining() < 4 {
             return Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "Not enough bytes to read",

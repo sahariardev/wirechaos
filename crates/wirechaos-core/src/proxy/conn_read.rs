@@ -6,9 +6,12 @@ use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;
 
+#[derive(Default)]
 pub enum ConnRead {
+    #[default]
+    Empty,
     Plain(OwnedReadHalf),
-    Tls(ReadHalf<TlsStream<TcpStream>>),
+    Tls(ReadHalf<TlsStream<TcpStream>>)
 }
 
 impl AsyncRead for ConnRead {
@@ -20,6 +23,7 @@ impl AsyncRead for ConnRead {
         match self.get_mut() {
             ConnRead::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
             ConnRead::Tls(stream) => Pin::new(stream).poll_read(cx, buf),
+            ConnRead::Empty => Poll::Ready(Ok(())),
         }
     }
 }

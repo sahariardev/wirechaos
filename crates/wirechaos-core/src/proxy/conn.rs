@@ -13,6 +13,7 @@ pub struct Conn {
     buffer_writer: BufWriter<ConnWrite>,
     pool: Arc<MultiBufferPool>,
     ssl_done: bool,
+    gss_done: bool,
     tls_acceptor: Option<TlsAcceptor>,
 }
 
@@ -33,6 +34,7 @@ impl Conn {
             buffer_writer: BufWriter::new(ConnWrite::Plain(write_half)),
             pool,
             ssl_done: false,
+            gss_done: false,
             tls_acceptor,
         }
     }
@@ -41,44 +43,71 @@ impl Conn {
         todo!("handle message")
     }
 
-    pub async fn handle_startup(mut self) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn handle_startup(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let buf = self.read_startup_packet().await?;
         let mut message_reader = MessageReader::new(buf);
         let protocol_code = message_reader.read_u32()?;
-
         match protocol_code {
             SSL_REQUEST_CODE => {
-                if self.ssl_done {
-                    return Err(Box::from("SSL Request is already done"));
-                }
-                self.ssl_done = true;
-
-                if self.tls_acceptor.is_some() {
-                    // Offer TLS: the client expects 'S' and then runs the
-                    // handshake on this socket.
-                    self.buffer_writer.write_all(b"S").await?;
-                    self.buffer_writer.flush().await?;
-
-                    self = self.promote_to_tls().await?;
-                } else {
-                    // No TLS support configured: decline and keep the
-                    // connection in plaintext.
-                    self.buffer_writer.write_all(b"N").await?;
-                    self.buffer_writer.flush().await?;
-                }
+                self.handle_ssl_request().await?;
+            }
+            GSSENC_REQUEST_CODE => {
+                self.handle_gssnc_request().await?;
+            }
+            CANCEL_REQUEST_CODE => {
+                self.handle_cancel_request(&mut message_reader)?;
             }
             _ => {}
         }
 
-        Ok(self)
+        Ok(())
     }
 
-    async fn promote_to_tls(mut self) -> Result<Self, Box<dyn std::error::Error>> {
-        let ConnRead::Plain(read_half) = self.buffer_reader.into_inner() else {
+    fn handle_cancel_request(&mut self, message_reader: &mut MessageReader) -> Result<(), Box<dyn std::error::Error>> {
+        todo!("handle cancel request")
+    }
+    async fn handle_gssnc_request(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.gss_done {
+            return Err(Box::from("GSSENC Request is already done"));
+        }
+        self.gss_done = true;
+
+        self.buffer_writer.write_all(b"N").await?;
+        self.buffer_writer.flush().await?;
+
+        Ok(())
+    }
+    async fn handle_ssl_request(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.ssl_done {
+            return Err(Box::from("SSL Request is already done"));
+        }
+        self.ssl_done = true;
+
+        if self.tls_acceptor.is_some() {
+            // Offer TLS: the client expects 'S' and then runs the
+            // handshake on this socket.
+            self.buffer_writer.write_all(b"S").await?;
+            self.buffer_writer.flush().await?;
+            self.promote_to_tls().await?;
+        } else {
+            // No TLS support configured: decline and keep the
+            // connection in plaintext.
+            self.buffer_writer.write_all(b"N").await?;
+            self.buffer_writer.flush().await?;
+        }
+
+        Ok(())
+    }
+
+    async fn promote_to_tls(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let reader = std::mem::replace(&mut self.buffer_reader, BufReader::new(ConnRead::Empty));
+        let writer = std::mem::replace(&mut self.buffer_writer, BufWriter::new(ConnWrite::Empty));
+
+        let ConnRead::Plain(read_half) = reader.into_inner() else {
             unreachable!("ssl_done guard prevents a double upgrade")
         };
 
-        let ConnWrite::Plain(write_half) = self.buffer_writer.into_inner() else {
+        let ConnWrite::Plain(write_half) = writer.into_inner() else {
             unreachable!("ssl_done guard prevents a double upgrade")
         };
 
@@ -90,7 +119,7 @@ impl Conn {
         let (read_half, write_half) = tokio::io::split(tls);
         self.buffer_reader = BufReader::new(ConnRead::Tls(read_half));
         self.buffer_writer = BufWriter::new(ConnWrite::Tls(write_half));
-        Ok(self)
+        Ok(())
     }
 
     pub async fn read_message_length(&mut self) -> Result<usize, Box<dyn std::error::Error>> {

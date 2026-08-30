@@ -2,6 +2,8 @@ use crate::proxy::buffer_pool::{MultiBufferPool, PooledBytes};
 use crate::proxy::conn_read::ConnRead;
 use crate::proxy::conn_write::ConnWrite;
 use crate::proxy::packet::MessageReader;
+use rustls::ProtocolVersion;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
@@ -12,15 +14,24 @@ pub struct Conn {
     buffer_reader: BufReader<ConnRead>,
     buffer_writer: BufWriter<ConnWrite>,
     pool: Arc<MultiBufferPool>,
+    //todo:: rename this to tls
     ssl_done: bool,
+    required_tls: bool,
     gss_done: bool,
     tls_acceptor: Option<TlsAcceptor>,
+    protocol_version: Option<u32>,
+    params: HashMap<String, String>,
 }
 
 const MAX_STARTUP_PACKET_LENGTH: u32 = 10000;
 const CANCEL_REQUEST_CODE: u32 = (1234 << 16) | 5678;
 const SSL_REQUEST_CODE: u32 = (1234 << 16) | 5679;
 const GSSENC_REQUEST_CODE: u32 = (1234 << 16) | 5680;
+
+//protocol version
+const PROTOCOL_MAJOR_VERSION: u32 = 3;
+const PROTOCOL_MINOR_VERSION: u32 = 0;
+const PROTOCOL_VERSION_NUMBER: u32 = (PROTOCOL_MAJOR_VERSION << 16) | PROTOCOL_MINOR_VERSION;
 
 impl Conn {
     pub fn new(
@@ -35,7 +46,11 @@ impl Conn {
             pool,
             ssl_done: false,
             gss_done: false,
+            //todo:: pass this from parent config
+            required_tls: false,
             tls_acceptor,
+            protocol_version: None,
+            params: HashMap::new(),
         }
     }
 
@@ -57,13 +72,46 @@ impl Conn {
             CANCEL_REQUEST_CODE => {
                 self.handle_cancel_request(&mut message_reader)?;
             }
+
+            PROTOCOL_VERSION_NUMBER => {
+                if self.required_tls && !self.ssl_done {
+                    //throw error in this case
+                }
+            }
             _ => {}
         }
 
         Ok(())
     }
 
-    fn handle_cancel_request(&mut self, message_reader: &mut MessageReader) -> Result<(), Box<dyn std::error::Error>> {
+    fn handle_startup_packet(
+        &mut self,
+        protocol_version: u32,
+        message_reader: &mut MessageReader,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.protocol_version = Some(protocol_version);
+
+        while message_reader.remaining() > 0 {
+            let key = message_reader.read_string()?;
+
+            if key == "" {
+                break;
+            }
+
+            let value = message_reader.read_string()?;
+            self.params.insert(key, value);
+        }
+
+        //parse param from key value pair
+        
+        //initiate authenticate
+        todo!("handle_startup packet")
+    }
+
+    fn handle_cancel_request(
+        &mut self,
+        message_reader: &mut MessageReader,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         todo!("handle cancel request")
     }
     async fn handle_gssnc_request(&mut self) -> Result<(), Box<dyn std::error::Error>> {

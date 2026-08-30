@@ -63,4 +63,23 @@ impl MessageReader {
 
         Ok(value)
     }
+
+    pub fn read_string(&mut self) -> Result<String, Box<dyn std::error::Error>> {
+        let start = self.pos;
+
+        while self.pos < self.buf.len() {
+            if self.buf[self.pos] == b'\0' {
+                let message = String::from_utf8(self.buf[start..self.pos].to_vec())?;
+                self.pos += 1;
+                return Ok(message);
+            }
+
+            self.pos += 1;
+        }
+
+        Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "Not enough bytes to read",
+        )))
+    }
 }

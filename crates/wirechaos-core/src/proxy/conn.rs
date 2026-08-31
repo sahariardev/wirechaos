@@ -2,7 +2,6 @@ use crate::proxy::buffer_pool::{MultiBufferPool, PooledBytes};
 use crate::proxy::conn_read::ConnRead;
 use crate::proxy::conn_write::ConnWrite;
 use crate::proxy::packet::MessageReader;
-use rustls::ProtocolVersion;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io;
@@ -103,7 +102,7 @@ impl Conn {
         }
 
         //parse param from key value pair
-        
+
         //initiate authenticate
         todo!("handle_startup packet")
     }

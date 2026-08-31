@@ -1,3 +1,5 @@
+use crate::proxy::replication_mode::ReplicationMode;
+use crate::proxy::replication_mode::ReplicationMode::{ReplicationLogical, ReplicationOff};
 use std::collections::HashMap;
 use tokio::io;
 
@@ -118,6 +120,22 @@ pub fn split_option_tokens(s: String) -> Vec<String> {
     tokens
 }
 
+pub fn parse_replication_mode(
+    value: String,
+) -> Result<ReplicationMode, Box<dyn std::error::Error>> {
+    match value.to_lowercase().as_str() {
+        "" | "false" | "off" | "no" | "0" | "f" | "n" => Ok(ReplicationOff),
+        "true" | "on" | "yes" | "1" | "t" | "y" => Ok(ReplicationMode::ReplicationPhysical),
+        "database" => Ok(ReplicationLogical),
+        _ => {
+            Err(Box::new(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid value",
+            )))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,18 +160,12 @@ mod tests {
         // Note: the tokenizer pushes the separator character onto the next
         // token, so every token after the first retains its leading space.
         // This documents current behavior.
-        assert_eq!(
-            split_option_tokens("a b c".to_string()),
-            ["a", "b", "c"]
-        );
+        assert_eq!(split_option_tokens("a b c".to_string()), ["a", "b", "c"]);
     }
 
     #[test]
     fn split_on_tab() {
-        assert_eq!(
-            split_option_tokens("a\tb".to_string()),
-            ["a", "b"]
-        );
+        assert_eq!(split_option_tokens("a\tb".to_string()), ["a", "b"]);
     }
 
     #[test]
@@ -166,26 +178,17 @@ mod tests {
 
     #[test]
     fn split_escaped_space_stays_in_token() {
-        assert_eq!(
-            split_option_tokens("a\\ b".to_string()),
-            ["a b"]
-        );
+        assert_eq!(split_option_tokens("a\\ b".to_string()), ["a b"]);
     }
 
     #[test]
     fn split_escaped_backslash_is_literal() {
-        assert_eq!(
-            split_option_tokens("a\\\\b".to_string()),
-            ["a\\b"]
-        );
+        assert_eq!(split_option_tokens("a\\\\b".to_string()), ["a\\b"]);
     }
 
     #[test]
     fn split_consecutive_spaces_produce_whitespace_tokens() {
-        assert_eq!(
-            split_option_tokens("a  b".to_string()),
-            ["a", " ", " b"]
-        );
+        assert_eq!(split_option_tokens("a  b".to_string()), ["a", " ", " b"]);
     }
 
     // ---- parse_options ----

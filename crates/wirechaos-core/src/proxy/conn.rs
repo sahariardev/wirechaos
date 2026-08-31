@@ -2,6 +2,8 @@ use crate::proxy::buffer_pool::{MultiBufferPool, PooledBytes};
 use crate::proxy::conn_read::ConnRead;
 use crate::proxy::conn_write::ConnWrite;
 use crate::proxy::packet::MessageReader;
+use crate::proxy::replication_mode::ReplicationMode;
+use crate::proxy::startup_config_parse_util::{parse_options, parse_replication_mode};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io;
@@ -20,6 +22,9 @@ pub struct Conn {
     tls_acceptor: Option<TlsAcceptor>,
     protocol_version: Option<u32>,
     params: HashMap<String, String>,
+    user: Option<String>,
+    database: Option<String>,
+    replication_mode: Option<ReplicationMode>,
 }
 
 const MAX_STARTUP_PACKET_LENGTH: u32 = 10000;
@@ -50,6 +55,8 @@ impl Conn {
             tls_acceptor,
             protocol_version: None,
             params: HashMap::new(),
+            user: None,
+            database: None,
         }
     }
 
@@ -101,10 +108,36 @@ impl Conn {
             self.params.insert(key, value);
         }
 
-        //parse param from key value pair
+        let option = self.params.get("options");
 
-        //initiate authenticate
-        todo!("handle_startup packet")
+        if let Some(value) = option {
+            let mut parsed = parse_options(value.to_string())?;
+            parsed.remove("replication");
+            self.params.extend(parsed);
+            self.params.remove("options");
+        }
+
+        if let Some(value) = self.params.get("user") {
+            self.user = Some(value.to_string());
+            self.database = Some(value.to_string());
+        }
+
+        if let Some(value) = self.params.get("database") {
+            if value != "" {
+                self.database = Some(value.to_string());
+            }
+        }
+
+        if let Some(value) = self.params.get("replication") {
+            let replication_mode = parse_replication_mode(value.to_string())?;
+            self.replication_mode = Some(replication_mode);
+        }
+
+        self.handle_authentication()
+    }
+
+    fn handle_authentication(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        todo!("handle_authentication")
     }
 
     fn handle_cancel_request(

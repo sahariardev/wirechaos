@@ -16,6 +16,12 @@ thiserror.workspace = true
 bytes.workspace = true
 tokio-rustls.workspace = true
 rustls.workspace = true
+sha2 = "0.10.0"
+hmac = "0.12.0"
+pbkdf2 = "0.12"
+base64 = "0.23.1"
+rand = "0.8"
+subtle = "2.5"
 rustls-pemfile.workspace = true
 
 [dev-dependencies]

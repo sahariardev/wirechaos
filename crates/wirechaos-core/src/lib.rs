@@ -1,5 +1,6 @@
 mod observability;
 pub mod proxy;
+mod auth;
 
 pub fn init_core() {
     observability::init_logging();

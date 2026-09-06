@@ -1,0 +1,45 @@
+use hmac::{Hmac, Mac};
+use sha2::{Digest, Sha256};
+
+#[derive(Clone)]
+pub struct Verifier {
+    pub iterations: u32,
+    pub salt: Vec<u8>,
+    pub stored_key: Vec<u8>,
+    pub server_key: Vec<u8>,
+}
+
+impl Verifier {
+    pub fn from_password(password: &str, salt: Vec<u8>, iterations: u32) -> Self {
+        let salted = pbkdf2_sha256(password.as_bytes(), &salt, iterations);
+        let client_key = hmac_sha256(&salted, b"Client Key");
+        let stored_key = sha256(&client_key);
+        let server_key = hmac_sha256(&salted, b"Server Key");
+
+        Verifier {
+            iterations,
+            salt,
+            stored_key: stored_key.to_vec(),
+            server_key: server_key.to_vec(),
+        }
+    }
+}
+
+fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    pbkdf2::pbkdf2_hmac::<Sha256>(password, salt, iterations, &mut out);
+    out
+}
+
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC can take key of any size");
+    mac.update(message);
+    mac.finalize().into_bytes().into()
+}
+
+fn sha256(input: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(input);
+    h.finalize().into()
+}

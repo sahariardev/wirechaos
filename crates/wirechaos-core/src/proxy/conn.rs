@@ -24,7 +24,7 @@ pub struct Conn {
     params: HashMap<String, String>,
     user: Option<String>,
     database: Option<String>,
-    replication_mode: Option<ReplicationMode>,
+    replication_mode: ReplicationMode,
 }
 
 const MAX_STARTUP_PACKET_LENGTH: u32 = 10000;
@@ -57,6 +57,7 @@ impl Conn {
             params: HashMap::new(),
             user: None,
             database: None,
+            replication_mode: ReplicationMode::ReplicationOff,
         }
     }
 
@@ -130,13 +131,14 @@ impl Conn {
 
         if let Some(value) = self.params.get("replication") {
             let replication_mode = parse_replication_mode(value.to_string())?;
-            self.replication_mode = Some(replication_mode);
+            self.replication_mode = replication_mode;
         }
 
         self.handle_authentication()
     }
 
     fn handle_authentication(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        //it will be fun to design this auth
         todo!("handle_authentication")
     }
 

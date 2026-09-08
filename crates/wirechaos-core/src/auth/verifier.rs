@@ -25,20 +25,20 @@ impl Verifier {
     }
 }
 
-fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
+pub fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
     let mut out = [0u8; 32];
     pbkdf2::pbkdf2_hmac::<Sha256>(password, salt, iterations, &mut out);
     out
 }
 
-fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     let mut mac =
         <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC can take key of any size");
     mac.update(message);
     mac.finalize().into_bytes().into()
 }
 
-fn sha256(input: &[u8]) -> [u8; 32] {
+pub fn sha256(input: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(input);
     h.finalize().into()

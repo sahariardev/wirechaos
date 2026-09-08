@@ -1,7 +1,8 @@
 use crate::auth::error::ScramError;
-use crate::auth::verifier::Verifier;
+use crate::auth::verifier::{hmac_sha256, sha256, Verifier};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use rand::RngCore;
+use subtle::ConstantTimeEq;
 
 #[derive(Debug, PartialEq)]
 enum State {
@@ -88,6 +89,102 @@ impl<'a> ScramAuthenticator<'a> {
         Ok(server_first)
     }
 
+    pub fn handle_client_final(&mut self, client_final: &str) -> Result<String, ScramError> {
+        if self.state != State::ClientFirstReceived {
+            return Err(ScramError::Protocol("unexpected client-final".into()));
+        }
+
+        self.state = State::Done;
+
+        let (mut cbind, mut nonce, mut proof_b64) = (None, None, None);
+
+        for attr in client_final.split(',') {
+            if let Some(v) = attr.strip_prefix("c=") {
+                if cbind.is_some() {
+                    return Err(ScramError::Protocol("duplicate cbind attribute".into()));
+                }
+                cbind = Some(v);
+            }
+
+            if let Some(v) = attr.strip_prefix("r=") {
+                if nonce.is_some() {
+                    return Err(ScramError::Protocol("duplicate nonce attribute".into()));
+                }
+                nonce = Some(v);
+            }
+
+            if let Some(v) = attr.strip_prefix("p=") {
+                if proof_b64.is_some() {
+                    return Err(ScramError::Protocol("duplicate proof attribute".into()));
+                }
+                proof_b64 = Some(v);
+            }
+        }
+
+        let cbind = cbind.ok_or_else(|| ScramError::Protocol("missing c=".into()))?;
+        let nonce = nonce.ok_or_else(|| ScramError::Protocol("missing r=".into()))?;
+        let proof_b64 = proof_b64.ok_or_else(|| ScramError::Protocol("missing p=".into()))?;
+
+        let expected_cbind = B64.encode(self.gs2_header.as_bytes());
+
+        if cbind
+            .as_bytes()
+            .ct_eq(&expected_cbind.as_bytes())
+            .unwrap_u8()
+            != 1
+        {
+            return Err(ScramError::Protocol("channel binding check failed".into()));
+        }
+
+        if nonce != self.combined_nonce {
+            return Err(ScramError::Protocol(
+                "nonce mismatch (possible replay)".into(),
+            ));
+        }
+
+        if !nonce.starts_with(&self.client_nonce) {
+            return Err(ScramError::Protocol(
+                "combined nonce lost client prefix".into(),
+            ));
+        }
+
+        let without_proof = &client_final[..client_final.rfind(",p=").unwrap()];
+        let auth_message = format!(
+            "{},{},{}",
+            self.client_first_bare, self.server_first, without_proof
+        );
+
+        let proof = B64
+            .decode(proof_b64)
+            .map_err(|_| ScramError::Protocol("proof is not valid base64".into()))?;
+
+        if proof.len() != 32 {
+            return Err(ScramError::Protocol("proof must be 32 bytes".into()));
+        }
+
+        let client_sig = hmac_sha256(&self.verifier.stored_key, auth_message.as_bytes());
+        let recovered_client_key: Vec<u8> = proof
+            .iter()
+            .zip(client_sig.iter())
+            .map(|(a, b)| a ^ b)
+            .collect();
+
+        let recovered_stored_key = sha256(&recovered_client_key);
+
+        if recovered_stored_key
+            .ct_eq(&self.verifier.stored_key[..])
+            .unwrap_u8()
+            != 1
+        {
+            return Err(ScramError::AuthenticationFailed);
+        }
+
+        self.extracted_client_key = Some(recovered_client_key);
+
+        let server_sig = hmac_sha256(&self.verifier.server_key, auth_message.as_bytes());
+        Ok(format!("v={}", B64.encode(server_sig)))
+    }
+
     fn validate_authzid_part(&self, authzid_part: &str) -> Result<(), ScramError> {
         if authzid_part.starts_with("a=") && authzid_part.len() > 2 {
             return Err(ScramError::Protocol(
@@ -156,7 +253,7 @@ impl<'a> ScramAuthenticator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::verifier::Verifier;
+    use crate::auth::verifier::{hmac_sha256, pbkdf2_sha256, sha256, Verifier};
     use base64::{engine::general_purpose::STANDARD as B64, Engine};
 
     const USER: &str = "user";
@@ -189,6 +286,94 @@ mod tests {
         }
     }
 
+    /// Parse the `r=...` combined nonce out of a server-first message.
+    fn combined_nonce_of(server_first: &str) -> String {
+        server_first
+            .split(',')
+            .next()
+            .expect("server-first must carry an r= attribute")
+            .strip_prefix("r=")
+            .expect("server-first must begin with r=")
+            .to_string()
+    }
+
+    /// Run the server to the point where it has issued server-first and is
+    /// waiting for client-final. `verifier()` must be built from "pencil".
+    fn begin_exchange(auth: &mut ScramAuthenticator<'_>) -> String {
+        let client_first = format!("n,,n={USER},r={CLIENT_NONCE}");
+        expect_ok(auth.handle_client_first(SCRAM_SHA_256, &client_first, USER))
+    }
+
+    /// Play the SCRAM client role for `password`: compute a genuine proof from
+    /// the server-first message and return (client-final, expected server-final).
+    ///
+    /// Everything here is derived independently from the password + the public
+    /// server-first attributes (RFC 5802), so it exercises the server against a
+    /// faithful client rather than against code that shares its bugs.
+    fn simulate_client(
+        password: &str,
+        client_first_bare: &str,
+        server_first: &str,
+        gs2_header: &str,
+    ) -> (String, String) {
+        let mut combined = "";
+        let mut salt_b64 = "";
+        let mut iterations = 0u32;
+        for attr in server_first.split(',') {
+            if let Some(v) = attr.strip_prefix("r=") {
+                combined = v;
+            } else if let Some(v) = attr.strip_prefix("s=") {
+                salt_b64 = v;
+            } else if let Some(v) = attr.strip_prefix("i=") {
+                iterations = v.parse().expect("server-first iterations must be a number");
+            }
+        }
+
+        let cbind = B64.encode(gs2_header.as_bytes());
+        let client_final_no_proof = format!("c={cbind},r={combined}");
+        let auth_message = format!("{client_first_bare},{server_first},{client_final_no_proof}");
+
+        let salt = B64.decode(salt_b64).expect("server-first salt must be base64");
+        let salted = pbkdf2_sha256(password.as_bytes(), &salt, iterations);
+
+        let client_key = hmac_sha256(&salted, b"Client Key");
+        let stored_key = sha256(&client_key);
+        let client_sig = hmac_sha256(&stored_key, auth_message.as_bytes());
+        let proof: Vec<u8> = client_key
+            .iter()
+            .zip(client_sig.iter())
+            .map(|(a, b)| a ^ b)
+            .collect();
+
+        // The client independently checks the server's signature against
+        // ServerKey = HMAC(SaltedPassword, "Server Key"), not StoredKey.
+        let server_key = hmac_sha256(&salted, b"Server Key");
+        let expected_server_final =
+            format!("v={}", B64.encode(hmac_sha256(&server_key, auth_message.as_bytes())));
+
+        let client_final = format!("c={cbind},r={combined},p={}", B64.encode(proof));
+        (client_final, expected_server_final)
+    }
+
+    /// Drive a full exchange (server + simulated client) to completion.
+    /// Returns (server-final actually returned, server-final the client expects).
+    fn full_client_exchange(
+        auth: &mut ScramAuthenticator<'_>,
+        password: &str,
+        gs2_header: &str,
+        client_nonce: &str,
+    ) -> (String, String) {
+        let flag = &gs2_header[..1];
+        let client_first = format!("{flag},,n={USER},r={client_nonce}");
+        let server_first = expect_ok(auth.handle_client_first(SCRAM_SHA_256, &client_first, USER));
+        let client_first_bare = format!("n={USER},r={client_nonce}");
+
+        let (client_final, expected_server_final) =
+            simulate_client(password, &client_first_bare, &server_first, gs2_header);
+        let server_final = expect_ok(auth.handle_client_final(&client_final));
+        (server_final, expected_server_final)
+    }
+
     #[test]
     fn mechanisms_offers_sha_256() {
         let v = verifier();
@@ -214,7 +399,9 @@ mod tests {
         // 32 random bytes => 44 base64 chars (STANDARD, padded).
         let server_nonce = server_first[prefix.len()..].split(',').next().unwrap();
         assert_eq!(server_nonce.len(), 44, "server nonce must be 32 raw bytes");
-        let decoded = B64.decode(server_nonce).expect("server nonce must be valid base64");
+        let decoded = B64
+            .decode(server_nonce)
+            .expect("server nonce must be valid base64");
         assert_eq!(decoded.len(), SERVER_NONCE_LENGTH);
 
         // salt + iteration count come straight from the verifier.
@@ -354,13 +541,161 @@ mod tests {
         let v = verifier();
         let auth = ScramAuthenticator::new(&v);
         let client_first = format!("n,,n={USER},r={CLIENT_NONCE}");
-        let (flag, authzid, bare) =
-            expect_ok(auth.extract_data_from_client_first(&client_first));
+        let (flag, authzid, bare) = expect_ok(auth.extract_data_from_client_first(&client_first));
         assert_eq!(flag, "n");
         assert_eq!(authzid, "");
         assert_eq!(bare, format!("n={USER},r={CLIENT_NONCE}"));
 
         let parts = auth.extract_data_from_client_first("n,");
         assert!(parts.is_err(), "two-part message must be rejected");
+    }
+
+    #[test]
+    fn ok_full_exchange_returns_verifiable_server_signature() {
+        let v = verifier();
+        let mut auth = ScramAuthenticator::new(&v);
+
+        let (server_final, expected) = full_client_exchange(&mut auth, "pencil", "n,,", CLIENT_NONCE);
+        assert_eq!(server_final, expected, "server-final must be HMAC(ServerKey, auth message)");
+        assert!(
+            server_final.starts_with("v="),
+            "server-final must be a v= attribute, got {server_final}"
+        );
+        assert!(auth.extracted_client_key.is_some());
+    }
+
+    #[test]
+    fn ok_full_exchange_accepts_y_gs2_flag() {
+        let v = verifier();
+        let mut auth = ScramAuthenticator::new(&v);
+
+        let (server_final, expected) = full_client_exchange(&mut auth, "pencil", "y,,", CLIENT_NONCE);
+        assert_eq!(server_final, expected);
+    }
+
+    #[test]
+    fn ok_state_is_done_after_successful_exchange() {
+        let v = verifier();
+        let mut auth = ScramAuthenticator::new(&v);
+        let (_, _) = full_client_exchange(&mut auth, "pencil", "n,,", CLIENT_NONCE);
+
+        let err = protocol_err(auth.handle_client_final("c=biws,r=x,p=AAAA"));
+        assert_eq!(err, "unexpected client-final");
+    }
+
+    #[test]
+    fn err_wrong_password_fails_authentication() {
+        let v = verifier();
+        let mut auth = ScramAuthenticator::new(&v);
+        let server_first = begin_exchange(&mut auth);
+
+        let bare = format!("n={USER},r={CLIENT_NONCE}");
+        let (client_final, _) = simulate_client("not-pencil", &bare, &server_first, "n,,");
+
+        assert!(
+            matches!(
+                auth.handle_client_final(&client_final),
+                Err(ScramError::AuthenticationFailed)
+            ),
+            "a proof derived from the wrong password must be rejected"
+        );
+    }
+
+    #[test]
+    fn err_client_final_out_of_order() {
+        let v = verifier();
+        let mut auth = ScramAuthenticator::new(&v);
+        // handle_client_final before any client-first.
+        let err = protocol_err(auth.handle_client_final("c=biws,r=x,p=AAAA"));
+        assert_eq!(err, "unexpected client-final");
+    }
+
+    #[test]
+    fn err_required_attributes_missing() {
+        let v = verifier();
+        let mut auth = ScramAuthenticator::new(&v);
+        begin_exchange(&mut auth);
+
+        // Missing-attribute checks run before the nonce is validated, so the
+        // attribute values here only need to be syntactically parseable.
+        let cases = [
+            ("r=x,p=AAAA", "missing c="),
+            ("c=biws,p=AAAA", "missing r="),
+            ("c=biws,r=x", "missing p="),
+        ];
+        for (message, expected) in cases {
+            let mut auth = ScramAuthenticator::new(&v);
+            begin_exchange(&mut auth);
+            assert_eq!(protocol_err(auth.handle_client_final(message)), expected);
+        }
+    }
+
+    #[test]
+    fn err_duplicate_attributes() {
+        let v = verifier();
+        let mut auth = ScramAuthenticator::new(&v);
+        begin_exchange(&mut auth);
+
+        let cases = [
+            ("c=biws,c=biws,r=x,p=AAAA", "duplicate cbind attribute"),
+            ("c=biws,r=x,r=y,p=AAAA", "duplicate nonce attribute"),
+            ("c=biws,r=x,p=AAAA,p=BBBB", "duplicate proof attribute"),
+        ];
+        for (message, expected) in cases {
+            let mut auth = ScramAuthenticator::new(&v);
+            begin_exchange(&mut auth);
+            assert_eq!(protocol_err(auth.handle_client_final(message)), expected);
+        }
+    }
+
+    #[test]
+    fn err_channel_binding_mismatch() {
+        let v = verifier();
+        let mut auth = ScramAuthenticator::new(&v);
+        begin_exchange(&mut auth); // server echoed GS2 header "n,,"
+
+        // cbind is base64 of "y,," ("eSws") instead of the echoed "n,," ("biws").
+        let client_final = "c=eSws,r=x,p=AAAA";
+        let err = protocol_err(auth.handle_client_final(client_final));
+        assert_eq!(err, "channel binding check failed");
+    }
+
+    #[test]
+    fn err_nonce_mismatch() {
+        let v = verifier();
+        let mut auth = ScramAuthenticator::new(&v);
+        let server_first = begin_exchange(&mut auth);
+        let combined = combined_nonce_of(&server_first);
+
+        // Drop the last character of the real combined nonce.
+        let truncated = format!("c=biws,r={},p=AAAA", &combined[..combined.len() - 1]);
+        let err = protocol_err(auth.handle_client_final(&truncated));
+        assert_eq!(err, "nonce mismatch (possible replay)");
+
+        // A completely different nonce.
+        let mut auth = ScramAuthenticator::new(&v);
+        begin_exchange(&mut auth);
+        let err = protocol_err(auth.handle_client_final("c=biws,r=totally-different,p=AAAA"));
+        assert_eq!(err, "nonce mismatch (possible replay)");
+    }
+
+    #[test]
+    fn err_malformed_proof() {
+        // Both malformed-proof cases are only reached after the nonce check, so
+        // each case runs its own exchange and derives its own combined nonce.
+        let cases: [(&str, &str); 2] = [
+            ("!!!not-base64!!!", "proof is not valid base64"),
+            // Valid base64 but the wrong length (16 bytes, not 32).
+            (&B64.encode(vec![0u8; 16]), "proof must be 32 bytes"),
+        ];
+
+        for (payload, expected) in cases {
+            let v = verifier();
+            let mut auth = ScramAuthenticator::new(&v);
+            let server_first = begin_exchange(&mut auth);
+            let nonce = combined_nonce_of(&server_first);
+            let message = format!("c=biws,r={nonce},p={payload}");
+            assert_eq!(protocol_err(auth.handle_client_final(&message)), expected);
+        }
     }
 }

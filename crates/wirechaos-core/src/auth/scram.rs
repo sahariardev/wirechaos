@@ -185,6 +185,10 @@ impl<'a> ScramAuthenticator<'a> {
         Ok(format!("v={}", B64.encode(server_sig)))
     }
 
+    pub fn extracted_client_key(&self) -> Option<Vec<u8>> {
+        self.extracted_client_key.clone()
+    }
+
     fn validate_authzid_part(&self, authzid_part: &str) -> Result<(), ScramError> {
         if authzid_part.starts_with("a=") && authzid_part.len() > 2 {
             return Err(ScramError::Protocol(

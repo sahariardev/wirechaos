@@ -1,4 +1,5 @@
 
+#[derive(Debug)]
 pub enum ScramError {
     AuthenticationFailed,
     Protocol(String),

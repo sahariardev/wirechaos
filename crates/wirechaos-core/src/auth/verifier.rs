@@ -1,6 +1,10 @@
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
+pub trait VerifierProvider {
+    fn get(&self, username: &str) -> Result<Verifier, Box<dyn std::error::Error>>;
+}
+
 #[derive(Clone)]
 pub struct Verifier {
     pub iterations: u32,

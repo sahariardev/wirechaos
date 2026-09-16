@@ -7,3 +7,4 @@ mod conn_read;
 mod conn_write;
 mod startup_config_parse_util;
 mod replication_mode;
+mod auth;

@@ -370,6 +370,7 @@ async fn double_gssenc_request_returns_error() {
 
     let server = tokio::spawn(async move {
         let (socket, _peer) = listener.accept().await.expect("accept");
+
         let mut conn = Conn::new(socket, pool, None);
 
         conn.handle_startup()

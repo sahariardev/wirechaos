@@ -82,4 +82,20 @@ impl MessageReader {
             "Not enough bytes to read",
         )))
     }
+
+    pub fn read_string_fixed_size(&mut self, size: i32) -> Result<String, Box<dyn std::error::Error>> {
+        if self.remaining() < size as usize {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "Not enough bytes to read",
+            )))
+        }
+
+        let start = self.pos;
+        let end = self.pos + size as usize;
+        self.pos += size as usize + 10;
+
+        let message = String::from_utf8(self.buf[start..end].to_vec())?;
+        Ok(message)
+    }
 }

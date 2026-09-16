@@ -1,3 +1,4 @@
+use crate::auth::verifier::VerifierProvider;
 use crate::proxy::buffer_pool::{MultiBufferPool, PooledBytes};
 use crate::proxy::conn_read::ConnRead;
 use crate::proxy::conn_write::ConnWrite;
@@ -11,20 +12,21 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWrit
 use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
 
-pub struct Conn {
-    buffer_reader: BufReader<ConnRead>,
-    buffer_writer: BufWriter<ConnWrite>,
-    pool: Arc<MultiBufferPool>,
+pub struct Conn<V: VerifierProvider> {
+    pub buffer_reader: BufReader<ConnRead>,
+    pub buffer_writer: BufWriter<ConnWrite>,
+    pub pool: Arc<MultiBufferPool>,
     //todo:: rename this to tls
-    ssl_done: bool,
-    required_tls: bool,
-    gss_done: bool,
-    tls_acceptor: Option<TlsAcceptor>,
-    protocol_version: Option<u32>,
-    params: HashMap<String, String>,
-    user: Option<String>,
-    database: Option<String>,
-    replication_mode: ReplicationMode,
+    pub ssl_done: bool,
+    pub required_tls: bool,
+    pub gss_done: bool,
+    pub tls_acceptor: Option<TlsAcceptor>,
+    pub protocol_version: Option<u32>,
+    pub params: HashMap<String, String>,
+    pub user: Option<String>,
+    pub database: Option<String>,
+    pub replication_mode: ReplicationMode,
+    pub provider: V,
 }
 
 const MAX_STARTUP_PACKET_LENGTH: u32 = 10000;
@@ -37,11 +39,12 @@ const PROTOCOL_MAJOR_VERSION: u32 = 3;
 const PROTOCOL_MINOR_VERSION: u32 = 0;
 const PROTOCOL_VERSION_NUMBER: u32 = (PROTOCOL_MAJOR_VERSION << 16) | PROTOCOL_MINOR_VERSION;
 
-impl Conn {
+impl<V: VerifierProvider> Conn<V> {
     pub fn new(
         stream: TcpStream,
         pool: Arc<MultiBufferPool>,
         tls_acceptor: Option<TlsAcceptor>,
+        verifier_provider: V,
     ) -> Self {
         let (read_half, write_half) = stream.into_split();
         Self {
@@ -58,6 +61,7 @@ impl Conn {
             user: None,
             database: None,
             replication_mode: ReplicationMode::ReplicationOff,
+            provider: verifier_provider,
         }
     }
 
@@ -84,6 +88,9 @@ impl Conn {
                 if self.required_tls && !self.ssl_done {
                     //throw error in this case
                 }
+
+                self.handle_startup_packet(protocol_code, &mut message_reader)
+                    .await?;
             }
             _ => {}
         }
@@ -91,7 +98,7 @@ impl Conn {
         Ok(())
     }
 
-    fn handle_startup_packet(
+    async fn handle_startup_packet(
         &mut self,
         protocol_version: u32,
         message_reader: &mut MessageReader,
@@ -134,12 +141,9 @@ impl Conn {
             self.replication_mode = replication_mode;
         }
 
-        self.handle_authentication()
-    }
+        self.handle_authentication().await?;
 
-    fn handle_authentication(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        //it will be fun to design this auth
-        todo!("handle_authentication")
+        Ok(())
     }
 
     fn handle_cancel_request(
@@ -263,6 +267,19 @@ impl Conn {
     pub async fn write_raw(&mut self, data: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
         self.buffer_writer.write_all(data).await?;
         self.buffer_writer.flush().await?;
+        Ok(())
+    }
+
+    pub async fn write_message(
+        &mut self,
+        message_type: u8,
+        body: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let len = (body.len() + 4) as u32;
+        self.buffer_writer.write_all(&[message_type]).await?;
+        self.buffer_writer.write_all(&len.to_be_bytes()).await?;
+        self.buffer_writer.write_all(body).await?;
+
         Ok(())
     }
 }

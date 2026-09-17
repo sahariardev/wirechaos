@@ -11,9 +11,9 @@ pub async fn run_server() -> anyhow::Result<()> {
             Ok((socket, addr)) => {
                 info!("accepted connection from {:?}", addr);
                 tokio::spawn(async move {
-                    handle_connection(socket, addr)
-                        .await
-                        .expect("failed to handle connection");
+                    if let Err(error) = handle_connection(socket, addr).await {
+                        warn!("failed to handle connection from {addr}: {error}");
+                    }
                 });
             }
             Err(e) => {

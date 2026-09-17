@@ -14,6 +14,11 @@
 //! must reach the client as a framed ErrorResponse or as an error return —
 //! never as a panic or a hung connection.
 
+// Test scaffolding: see the note in `common/mod.rs`. Production code keeps the
+// `unwrap_used`/`expect_used` deny; helpers in a separate integration-test crate
+// need the relaxation stated explicitly.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 mod common;
 
 use std::net::SocketAddr;

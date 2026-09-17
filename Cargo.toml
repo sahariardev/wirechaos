@@ -25,3 +25,36 @@ bytes = "1.6"
 tokio-rustls = "0.24"
 rustls = "0.21"
 rustls-pemfile = "2.0"
+
+# Lint policy. Members opt in with `[lints] workspace = true`.
+#
+# The bar is "production grade proxy": a client must never be able to make the
+# process panic, and a fault must never be silent. Lints that enforce those two
+# properties are denied; everything else stays at clippy's default level so the
+# signal is not drowned by style noise. `clippy.toml` relaxes the panic-related
+# lints inside tests, where panicking is how a failure is reported.
+[workspace.lints.rust]
+unsafe_code = "warn"
+unused_must_use = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+non_ascii_idents = "deny"
+# `missing_docs` is deliberately deferred: tasks 13-16 reshape the public surface
+# (message model, codecs, rule schema) and documenting it twice is wasted work.
+
+[workspace.lints.clippy]
+# Groups carry a lower priority than the individual lints below, so a specific
+# decision (for example `unwrap_used = "deny"`) always wins over a group level.
+all = { level = "warn", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+# Panicking on data that came off the wire is a bug, not a shortcut: see the
+# error taxonomy in doc/tasks/01-scram-sha-256.md and 04-startup-phase-completion.md.
+unwrap_used = "deny"
+expect_used = "deny"
+panic_in_result_fn = "warn"
+unreachable = "deny"
+# Debugging leftovers and silent error discards.
+dbg_macro = "deny"
+todo = "warn"

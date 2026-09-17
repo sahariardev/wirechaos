@@ -1,9 +1,9 @@
-pub mod server;
-pub mod conn;
+mod auth;
 pub mod buffer_pool;
-mod packet;
+pub mod conn;
 mod conn_read;
 mod conn_write;
-mod startup_config_parse_util;
+mod packet;
 mod replication_mode;
-mod auth;
+pub mod server;
+mod startup_config_parse_util;

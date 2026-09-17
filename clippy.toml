@@ -1,0 +1,36 @@
+# Clippy configuration for the wirechaos workspace.
+#
+# Policy: production code must not panic on input it does not control. A proxy that
+# aborts the process because one client sent a malformed frame is a worse failure
+# than the malformed frame itself, so `unwrap_used`/`expect_used` are denied in the
+# workspace lint table and allowed only inside tests (below). Deliberate exceptions
+# carry a local `#[allow(..., reason)]` and a justification comment.
+
+# Keep the advertised MSRV honest: bump this only with a deliberate decision.
+msrv = "1.75"
+
+# Tests are allowed to panic: an assertion is how a test reports a failure, and
+# forcing `?`/`expect`-free test code would hide intent rather than improve safety.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-dbg-in-tests = true
+allow-indexing-slicing-in-tests = true
+
+disallowed-methods = [
+    # Blocking sleep inside a tokio task starves the executor's worker thread.
+    # Use `tokio::time::sleep`, or `#[tokio::test(start_paused = true)]` when the
+    # test needs deterministic timing (see doc/tasks/11-performance-validation.md).
+    { path = "std::thread::sleep", reason = "blocking sleep stalls the async runtime; use tokio::time::sleep" },
+    # Exiting mid-flight skips RAII teardown: session deregistration, buffer return,
+    # metrics flush. Return an error and let `main` decide the exit code.
+    { path = "std::process::exit", reason = "skips RAII teardown (session cleanup, metrics flush); propagate instead" },
+    # Process-global mutation makes tests order-dependent and is unsafe in edition
+    # 2024. Configuration is passed explicitly through the config types.
+    { path = "std::env::set_var", reason = "process-global mutation; thread configuration through the config types" },
+    { path = "std::env::remove_var", reason = "process-global mutation; thread configuration through the config types" },
+    # Blocking channels in async code deadlock the runtime. The relay uses bounded
+    # tokio channels for backpressure (doc/tasks/06-relay-engine.md).
+    { path = "std::sync::mpsc::channel", reason = "blocking channel in async code; use tokio::sync::mpsc" },
+]
+

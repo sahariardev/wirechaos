@@ -36,8 +36,13 @@ pub fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] 
 }
 
 pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
-    let mut mac =
-        <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC can take key of any size");
+    // HMAC accepts a key of any length, so this cannot fail. The lint is allowed
+    // here rather than propagated because threading a `Result` through every SCRAM
+    // code path for an impossible error would obscure the real failure modes
+    // (bad proof, bad nonce) that callers must actually handle.
+    #[allow(clippy::expect_used)]
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key)
+        .expect("HMAC accepts a key of any length, so this cannot fail");
     mac.update(message);
     mac.finalize().into_bytes().into()
 }

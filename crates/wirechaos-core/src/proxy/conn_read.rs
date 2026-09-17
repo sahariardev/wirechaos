@@ -1,4 +1,3 @@
-
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf, ReadHalf};
@@ -11,7 +10,7 @@ pub enum ConnRead {
     #[default]
     Empty,
     Plain(OwnedReadHalf),
-    Tls(ReadHalf<TlsStream<TcpStream>>)
+    Tls(ReadHalf<TlsStream<TcpStream>>),
 }
 
 impl AsyncRead for ConnRead {

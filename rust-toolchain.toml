@@ -1,0 +1,7 @@
+[toolchain]
+# Pinned to the stable channel so `rustfmt` and `clippy` in CI match a developer's
+# local run. The MSRV in clippy.toml is the floor for the *code*; this file is the
+# floor for the *toolchain*.
+channel = "stable"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

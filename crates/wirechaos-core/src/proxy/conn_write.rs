@@ -6,7 +6,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;
 
 #[derive(Default)]
-pub enum ConnWrite{
+pub enum ConnWrite {
     #[default]
     Empty,
     Plain(OwnedWriteHalf),
@@ -14,7 +14,11 @@ pub enum ConnWrite{
 }
 
 impl AsyncWrite for ConnWrite {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
         match self.get_mut() {
             ConnWrite::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
             ConnWrite::Tls(stream) => Pin::new(stream).poll_write(cx, buf),

@@ -251,12 +251,7 @@ impl<'a> ScramAuthenticator<'a> {
                 ))
             }
 
-            _ => {
-                return Err(ScramError::Protocol(format!(
-                    "invalid gs2 flag: {}",
-                    flag
-                )))
-            }
+            _ => return Err(ScramError::Protocol(format!("invalid gs2 flag: {}", flag))),
         };
 
         Ok(())
@@ -346,7 +341,9 @@ mod tests {
         let client_final_no_proof = format!("c={cbind},r={combined}");
         let auth_message = format!("{client_first_bare},{server_first},{client_final_no_proof}");
 
-        let salt = B64.decode(salt_b64).expect("server-first salt must be base64");
+        let salt = B64
+            .decode(salt_b64)
+            .expect("server-first salt must be base64");
         let salted = pbkdf2_sha256(password.as_bytes(), &salt, iterations);
 
         let client_key = hmac_sha256(&salted, b"Client Key");
@@ -361,8 +358,10 @@ mod tests {
         // The client independently checks the server's signature against
         // ServerKey = HMAC(SaltedPassword, "Server Key"), not StoredKey.
         let server_key = hmac_sha256(&salted, b"Server Key");
-        let expected_server_final =
-            format!("v={}", B64.encode(hmac_sha256(&server_key, auth_message.as_bytes())));
+        let expected_server_final = format!(
+            "v={}",
+            B64.encode(hmac_sha256(&server_key, auth_message.as_bytes()))
+        );
 
         let client_final = format!("c={cbind},r={combined},p={}", B64.encode(proof));
         (client_final, expected_server_final)
@@ -427,9 +426,8 @@ mod tests {
         );
 
         // AuthMessage = client-first-bare + server-first + client-final-without-proof.
-        let auth_message = format!(
-            "{RFC_CLIENT_FIRST_BARE},{RFC_SERVER_FIRST},{RFC_CLIENT_FINAL_WITHOUT_PROOF}"
-        );
+        let auth_message =
+            format!("{RFC_CLIENT_FIRST_BARE},{RFC_SERVER_FIRST},{RFC_CLIENT_FINAL_WITHOUT_PROOF}");
 
         // The published proof XOR ClientSignature must recover ClientKey, which
         // in turn must hash back to StoredKey.
@@ -453,7 +451,10 @@ mod tests {
 
         // ServerSignature = HMAC(ServerKey, AuthMessage).
         let server_signature = hmac_sha256(&verifier.server_key, auth_message.as_bytes());
-        assert_eq!(format!("v={}", B64.encode(server_signature)), RFC_SERVER_FINAL);
+        assert_eq!(
+            format!("v={}", B64.encode(server_signature)),
+            RFC_SERVER_FINAL
+        );
     }
 
     #[test]
@@ -630,8 +631,12 @@ mod tests {
         let v = verifier();
         let mut auth = ScramAuthenticator::new(&v);
 
-        let (server_final, expected) = full_client_exchange(&mut auth, "pencil", "n,,", CLIENT_NONCE);
-        assert_eq!(server_final, expected, "server-final must be HMAC(ServerKey, auth message)");
+        let (server_final, expected) =
+            full_client_exchange(&mut auth, "pencil", "n,,", CLIENT_NONCE);
+        assert_eq!(
+            server_final, expected,
+            "server-final must be HMAC(ServerKey, auth message)"
+        );
         assert!(
             server_final.starts_with("v="),
             "server-final must be a v= attribute, got {server_final}"
@@ -644,7 +649,8 @@ mod tests {
         let v = verifier();
         let mut auth = ScramAuthenticator::new(&v);
 
-        let (server_final, expected) = full_client_exchange(&mut auth, "pencil", "y,,", CLIENT_NONCE);
+        let (server_final, expected) =
+            full_client_exchange(&mut auth, "pencil", "y,,", CLIENT_NONCE);
         assert_eq!(server_final, expected);
     }
 

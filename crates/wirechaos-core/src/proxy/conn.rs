@@ -60,13 +60,19 @@ impl<V: VerifierProvider> Conn<V> {
             params: HashMap::new(),
             user: None,
             database: None,
-            replication_mode: ReplicationMode::ReplicationOff,
+            replication_mode: ReplicationMode::Off,
             provider: verifier_provider,
         }
     }
 
+    /// Drive the connection after the startup phase.
+    ///
+    /// Implemented by the relay: see doc/tasks/06-relay-engine.md. The `allow` is
+    /// deliberate and tracked there — the lint stays active for new code, while this
+    /// known gap is visible rather than hidden.
+    #[allow(clippy::todo)]
     pub async fn handle(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        todo!("handle message")
+        todo!("handle message: implemented in task 6 (relay engine)")
     }
 
     pub async fn handle_startup(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -149,11 +155,15 @@ impl<V: VerifierProvider> Conn<V> {
         Ok(())
     }
 
+    /// Route a `CancelRequest` to the session it names.
+    ///
+    /// Implemented by the session registry: see doc/tasks/09-session-registry.md.
+    #[allow(clippy::todo)]
     fn handle_cancel_request(
         &mut self,
         _message_reader: &mut MessageReader,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        todo!("handle cancel request")
+        todo!("handle cancel request: implemented in task 9 (session registry)")
     }
     async fn handle_gssnc_request(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.gss_done {
@@ -193,11 +203,20 @@ impl<V: VerifierProvider> Conn<V> {
         let writer = std::mem::replace(&mut self.buffer_writer, BufWriter::new(ConnWrite::Empty));
 
         let ConnRead::Plain(read_half) = reader.into_inner() else {
-            unreachable!("ssl_done guard prevents a double upgrade")
+            // The `ssl_done` guard should make this unreachable, but a panic here
+            // would take down the whole session task. Report it as a protocol-level
+            // error instead, so one connection fails loudly and the rest survive.
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TLS promotion requested on a connection that is not plaintext",
+            )));
         };
 
         let ConnWrite::Plain(write_half) = writer.into_inner() else {
-            unreachable!("ssl_done guard prevents a double upgrade")
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TLS promotion requested on a connection that is not plaintext",
+            )));
         };
 
         let tcp = read_half.reunite(write_half)?;
@@ -236,16 +255,13 @@ impl<V: VerifierProvider> Conn<V> {
             )));
         }
 
-        let message = self.read_message_body(length).await?;
-
-        if message.is_none() {
-            return Err(Box::new(io::Error::new(
+        match self.read_message_body(length).await? {
+            Some(message) => Ok(message),
+            None => Err(Box::new(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "Message body is empty",
-            )));
+            ))),
         }
-
-        Ok(message.unwrap())
     }
 
     pub async fn read_message_body(

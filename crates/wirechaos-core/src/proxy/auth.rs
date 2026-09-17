@@ -36,11 +36,7 @@ impl<V: VerifierProvider> Conn<V> {
         self.send_auth_sasl(&mechanics).await?;
         let (chosen, client_first) = self.read_sasl_initial_response(&mechanics).await?;
 
-        let server_first = match scram.handle_client_first(
-            &chosen,
-            &client_first,
-            &user,
-        ) {
+        let server_first = match scram.handle_client_first(&chosen, &client_first, &user) {
             Ok(message) => message,
 
             Err(e) => {
@@ -96,16 +92,14 @@ impl<V: VerifierProvider> Conn<V> {
             )));
         }
 
-        let message_buf = self.read_message_body(len).await?;
-
-        if message_buf.is_none() {
+        let Some(message_buf) = self.read_message_body(len).await? else {
             return Err(Box::new(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "Message body is empty",
             )));
-        }
+        };
 
-        let mut message = MessageReader::new(message_buf.unwrap());
+        let mut message = MessageReader::new(message_buf);
 
         let mechanism = message.read_string()?;
 
@@ -150,16 +144,14 @@ impl<V: VerifierProvider> Conn<V> {
             )));
         }
 
-        let message_buf = self.read_message_body(len).await?;
-
-        if message_buf.is_none() {
+        let Some(message_buf) = self.read_message_body(len).await? else {
             return Err(Box::new(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "Message body is empty",
             )));
-        }
+        };
 
-        Ok(String::from_utf8_lossy(&message_buf.unwrap()).into_owned())
+        Ok(String::from_utf8_lossy(&message_buf).into_owned())
     }
     async fn send_auth_sasl(
         &mut self,

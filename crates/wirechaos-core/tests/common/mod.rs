@@ -3,6 +3,12 @@
 //! Cargo compiles every file in `tests/` as its own crate, so anything used by
 //! more than one of them lives here and is pulled in with `mod common;`.
 
+// Panicking is how a test reports a failed expectation, which is what clippy's
+// `allow-*-in-tests` options encode. Integration test files are compiled as their
+// own crate, so those settings do not reach the helper functions below; the allow is
+// therefore stated once here, for test scaffolding only. Production code keeps the
+// deny (see the [workspace.lints] table in Cargo.toml).
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![allow(dead_code)] // each test crate uses a different subset of these helpers
 
 use std::collections::HashMap;

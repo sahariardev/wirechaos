@@ -14,6 +14,11 @@ impl MessageReader {
         self.buf.len() - self.pos
     }
 
+    /// Read a single byte from the body.
+    ///
+    /// Part of the typed message model: unused until the protocol engine reads
+    /// single-byte fields (doc/tasks/13-protocol-message-model.md).
+    #[allow(dead_code)]
     pub fn read_byte(&mut self) -> Result<u8, Box<dyn std::error::Error>> {
         if self.remaining() == 0 {
             return Err(Box::new(std::io::Error::new(
@@ -29,6 +34,12 @@ impl MessageReader {
         Ok(byte)
     }
 
+    /// Read a big-endian `Int16` from the body.
+    ///
+    /// Part of the typed message model: unused until the protocol engine reads
+    /// `Int16` fields such as `RowDescription` column counts
+    /// (doc/tasks/13-protocol-message-model.md).
+    #[allow(dead_code)]
     pub fn read_u16(&mut self) -> Result<u16, Box<dyn std::error::Error>> {
         if self.remaining() < 2 {
             return Err(Box::new(std::io::Error::new(
@@ -83,12 +94,15 @@ impl MessageReader {
         )))
     }
 
-    pub fn read_string_fixed_size(&mut self, size: i32) -> Result<String, Box<dyn std::error::Error>> {
+    pub fn read_string_fixed_size(
+        &mut self,
+        size: i32,
+    ) -> Result<String, Box<dyn std::error::Error>> {
         if self.remaining() < size as usize {
             return Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "Not enough bytes to read",
-            )))
+            )));
         }
 
         let start = self.pos;

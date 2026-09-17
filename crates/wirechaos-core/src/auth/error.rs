@@ -1,4 +1,3 @@
-
 #[derive(Debug)]
 pub enum ScramError {
     AuthenticationFailed,
@@ -6,10 +5,10 @@ pub enum ScramError {
 }
 
 impl std::fmt::Display for ScramError {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ScramError::AuthenticationFailed => write!(f, "Authentication failed"),
-            ScramError::Protocol(error) => write!(f, "scram protocol violation{}", error),
+            ScramError::Protocol(error) => write!(f, "scram protocol violation: {error}"),
         }
     }
 }

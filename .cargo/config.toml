@@ -1,0 +1,9 @@
+# Cargo aliases so the same commands run locally and in CI.
+#
+# `cargo lint` is the gate: it fails on any clippy warning, which is what keeps the
+# lint table in the workspace Cargo.toml meaningful.
+
+[alias]
+lint = ["clippy", "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings"]
+lint-fix = ["clippy", "--workspace", "--all-targets", "--all-features", "--fix", "--allow-dirty", "--allow-staged", "--", "-D", "warnings"]
+fmt-check = ["fmt", "--all", "--", "--check"]

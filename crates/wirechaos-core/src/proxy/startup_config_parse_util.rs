@@ -1,5 +1,5 @@
 use crate::proxy::replication_mode::ReplicationMode;
-use crate::proxy::replication_mode::ReplicationMode::{ReplicationLogical, ReplicationOff};
+use crate::proxy::replication_mode::ReplicationMode::{Logical, Off};
 use std::collections::HashMap;
 use tokio::io;
 
@@ -10,8 +10,8 @@ pub fn parse_options(
     let mut result: HashMap<String, String> = HashMap::new();
     let mut i = 0;
 
-    while i < tokens.len() {
-        let token = tokens.get(i).unwrap().as_str();
+    while let Some(token) = tokens.get(i) {
+        let token = token.as_str();
 
         match token {
             //"-c key=value"
@@ -110,15 +110,13 @@ pub fn parse_replication_mode(
     value: String,
 ) -> Result<ReplicationMode, Box<dyn std::error::Error>> {
     match value.to_lowercase().as_str() {
-        "" | "false" | "off" | "no" | "0" | "f" | "n" => Ok(ReplicationOff),
-        "true" | "on" | "yes" | "1" | "t" | "y" => Ok(ReplicationMode::ReplicationPhysical),
-        "database" => Ok(ReplicationLogical),
-        _ => {
-            Err(Box::new(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid value",
-            )))
-        }
+        "" | "false" | "off" | "no" | "0" | "f" | "n" => Ok(Off),
+        "true" | "on" | "yes" | "1" | "t" | "y" => Ok(ReplicationMode::Physical),
+        "database" => Ok(Logical),
+        _ => Err(Box::new(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid value",
+        ))),
     }
 }
 

@@ -8,7 +8,7 @@ use crate::proxy::startup_config_parse_util::{parse_options, parse_replication_m
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
 
@@ -86,7 +86,10 @@ impl<V: VerifierProvider> Conn<V> {
 
             PROTOCOL_VERSION_NUMBER => {
                 if self.required_tls && !self.ssl_done {
-                    //throw error in this case
+                    return Err(Box::new(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "TLS is required but the client did not request it",
+                    )));
                 }
 
                 self.handle_startup_packet(protocol_code, &mut message_reader)
@@ -108,7 +111,7 @@ impl<V: VerifierProvider> Conn<V> {
         while message_reader.remaining() > 0 {
             let key = message_reader.read_string()?;
 
-            if key == "" {
+            if key.is_empty() {
                 break;
             }
 
@@ -131,7 +134,7 @@ impl<V: VerifierProvider> Conn<V> {
         }
 
         if let Some(value) = self.params.get("database") {
-            if value != "" {
+            if !value.is_empty() {
                 self.database = Some(value.to_string());
             }
         }
@@ -148,7 +151,7 @@ impl<V: VerifierProvider> Conn<V> {
 
     fn handle_cancel_request(
         &mut self,
-        message_reader: &mut MessageReader,
+        _message_reader: &mut MessageReader,
     ) -> Result<(), Box<dyn std::error::Error>> {
         todo!("handle cancel request")
     }
@@ -253,6 +256,17 @@ impl<V: VerifierProvider> Conn<V> {
             return Ok(None);
         }
 
+        if length > self.pool.max_capacity() {
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Invalid message length: {} exceeds buffer pool capacity {}",
+                    length,
+                    self.pool.max_capacity()
+                ),
+            )));
+        }
+
         let pool = self.pool.clone();
 
         let mut buf = pool.get(length);
@@ -279,6 +293,7 @@ impl<V: VerifierProvider> Conn<V> {
         self.buffer_writer.write_all(&[message_type]).await?;
         self.buffer_writer.write_all(&len.to_be_bytes()).await?;
         self.buffer_writer.write_all(body).await?;
+        self.buffer_writer.flush().await?;
 
         Ok(())
     }

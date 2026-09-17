@@ -15,7 +15,7 @@ impl MessageReader {
     }
 
     pub fn read_byte(&mut self) -> Result<u8, Box<dyn std::error::Error>> {
-        if self.remaining() <= 0 {
+        if self.remaining() == 0 {
             return Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "Message body is empty",
@@ -93,9 +93,47 @@ impl MessageReader {
 
         let start = self.pos;
         let end = self.pos + size as usize;
-        self.pos += size as usize + 10;
+        self.pos = end;
 
         let message = String::from_utf8(self.buf[start..end].to_vec())?;
         Ok(message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proxy::buffer_pool::MultiBufferPool;
+
+    /// A reader over exactly `bytes`, backed by a pool that can serve them.
+    fn reader_with(bytes: &[u8]) -> MessageReader {
+        let pool_size = bytes.len().next_power_of_two().max(4);
+        let pool = MultiBufferPool::new(pool_size, pool_size, 1);
+
+        let mut buf = pool.get(bytes.len());
+        buf.copy_from_slice(bytes);
+
+        MessageReader::new(buf)
+    }
+
+    #[test]
+    fn read_string_fixed_size_consumes_only_the_string() {
+        let mut reader = reader_with(b"abcd\x00\x00\x00\x01");
+
+        assert_eq!(reader.read_string_fixed_size(4).unwrap(), "abcd");
+        assert_eq!(
+            reader.remaining(),
+            4,
+            "the reader must stop right after the fixed-size string"
+        );
+        assert_eq!(reader.read_u32().unwrap(), 1);
+        assert_eq!(reader.remaining(), 0);
+    }
+
+    #[test]
+    fn read_string_fixed_size_rejects_a_short_buffer() {
+        let mut reader = reader_with(b"abcd");
+
+        assert!(reader.read_string_fixed_size(8).is_err());
     }
 }

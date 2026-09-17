@@ -1,7 +1,7 @@
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, ReadBuf, ReadHalf, WriteHalf};
+use tokio::io::{AsyncRead, ReadBuf, ReadHalf};
 use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;

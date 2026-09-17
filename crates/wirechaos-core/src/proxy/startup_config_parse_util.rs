@@ -8,68 +8,36 @@ pub fn parse_options(
 ) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
     let tokens = split_option_tokens(options);
     let mut result: HashMap<String, String> = HashMap::new();
-    for mut i in 0..tokens.len() {
+    let mut i = 0;
+
+    while i < tokens.len() {
         let token = tokens.get(i).unwrap().as_str();
 
         match token {
             //"-c key=value"
             "-c" => {
-                i = i + 1;
-                if i >= tokens.len() {
-                    return Err(Box::new(io::Error::new(
+                i += 1;
+                let value_token = tokens.get(i).ok_or_else(|| {
+                    io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("missing value after -c: {}", i),
-                    )));
-                }
+                    )
+                })?;
 
-                let keyvalue = tokens
-                    .get(i)
-                    .unwrap()
-                    .as_str()
-                    .split('=')
-                    .collect::<Vec<&str>>();
-
-                let key = keyvalue.get(0).unwrap();
-                let value = keyvalue.get(1).unwrap();
-
-                if key.len() == 0 || value.len() == 0 {
-                    return Err(Box::new(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "invalid key/value size",
-                    )));
-                }
+                let (key, value) = split_key_value(value_token)?;
 
                 result.insert(key.to_string(), value.to_string());
             }
 
             //-ckey=value
             t if t.starts_with("-c") => {
-                let rest = &t[2..];
-                let keyvalue = rest.split('=').collect::<Vec<&str>>();
+                let (key, value) = split_key_value(&t[2..])?;
 
-                let key = keyvalue.get(0).unwrap();
-                let value = keyvalue.get(1).unwrap();
-                if key.len() == 0 || value.len() == 0 {
-                    return Err(Box::new(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "invalid key/value size",
-                    )));
-                }
                 result.insert(key.to_string(), value.to_string());
             }
 
             t if t.starts_with("--") => {
-                let rest = &t[2..];
-                let keyvalue = rest.split('=').collect::<Vec<&str>>();
-
-                let key = keyvalue.get(0).unwrap();
-                let value = keyvalue.get(1).unwrap();
-                if key.len() == 0 || value.len() == 0 {
-                    return Err(Box::new(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "invalid key/value size",
-                    )));
-                }
+                let (key, value) = split_key_value(&t[2..])?;
 
                 let key = key.replace("-", "_");
 
@@ -82,8 +50,26 @@ pub fn parse_options(
                 )))
             }
         }
+
+        i += 1;
     }
+
     Ok(result)
+}
+
+fn split_key_value(token: &str) -> Result<(&str, &str), Box<dyn std::error::Error>> {
+    let (key, value) = token
+        .split_once('=')
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid key/value size"))?;
+
+    if key.is_empty() || value.is_empty() {
+        return Err(Box::new(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid key/value size",
+        )));
+    }
+
+    Ok((key, value))
 }
 pub fn split_option_tokens(s: String) -> Vec<String> {
     let mut tokens: Vec<String> = Vec::new();
@@ -103,7 +89,7 @@ pub fn split_option_tokens(s: String) -> Vec<String> {
         }
 
         if c == ' ' || c == '\t' {
-            if curr.len() > 0 {
+            if !curr.is_empty() {
                 tokens.push(curr);
                 curr = String::new();
             }
@@ -113,7 +99,7 @@ pub fn split_option_tokens(s: String) -> Vec<String> {
         curr.push(c);
     }
 
-    if curr.len() > 0 {
+    if !curr.is_empty() {
         tokens.push(curr);
     }
 
@@ -157,9 +143,7 @@ mod tests {
 
     #[test]
     fn split_on_single_space() {
-        // Note: the tokenizer pushes the separator character onto the next
-        // token, so every token after the first retains its leading space.
-        // This documents current behavior.
+        // The separator is consumed, never carried into a token.
         assert_eq!(split_option_tokens("a b c".to_string()), ["a", "b", "c"]);
     }
 
@@ -187,8 +171,10 @@ mod tests {
     }
 
     #[test]
-    fn split_consecutive_spaces_produce_whitespace_tokens() {
-        assert_eq!(split_option_tokens("a  b".to_string()), ["a", " ", " b"]);
+    fn split_consecutive_spaces_collapse_into_one_separator() {
+        // Runs of whitespace are separators, not tokens: no empty or
+        // whitespace-only token is produced.
+        assert_eq!(split_option_tokens("a  b".to_string()), ["a", "b"]);
     }
 
     // ---- parse_options ----
@@ -216,13 +202,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_dash_c_with_separate_value() {
-        // "-c key=value" never reaches the value: the `-c` arm does
-        // `i = i + 1`, but mutating a for-loop variable has no effect on the
-        // range iterator, so " k=value" is re-matched and falls through to
-        // the unsupported-option arm. Documents current behavior.
-        let err = parse_options("-c k=value".to_string()).unwrap_err();
-        assert_eq!(err.to_string(), "Unsupported option");
+    fn parse_dash_c_with_separate_value() {
+        // "-c key=value": the `-c` arm consumes the following token.
+        let map = parse_options("-c k=value".to_string()).unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get("k").map(String::as_str), Some("value"));
     }
 
     #[test]
@@ -232,12 +216,32 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_second_option_due_to_leading_space_token() {
-        // The tokenizer keeps the separator in later tokens, so a "--foo=bar"
-        // after the first option arrives as " --foo=bar" and fails the
-        // starts_with("--") guard. Documents current behavior.
-        let err = parse_options("-ck=v --foo=bar".to_string()).unwrap_err();
-        assert_eq!(err.to_string(), "Unsupported option");
+    fn parse_multiple_space_separated_options() {
+        // Whitespace separates options, so every one of them is parsed.
+        let map = parse_options("-ck=v --foo=bar".to_string()).unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("k").map(String::as_str), Some("v"));
+        assert_eq!(map.get("foo").map(String::as_str), Some("bar"));
+    }
+
+    #[test]
+    fn parse_rejects_joined_dash_c_without_equals() {
+        // A missing '=' must be an error, not a panic on the client's input.
+        let err = parse_options("-ck".to_string()).unwrap_err();
+        assert_eq!(err.to_string(), "invalid key/value size");
+    }
+
+    #[test]
+    fn parse_rejects_double_dash_without_equals() {
+        let err = parse_options("--connection-limit".to_string()).unwrap_err();
+        assert_eq!(err.to_string(), "invalid key/value size");
+    }
+
+    #[test]
+    fn parse_value_may_contain_equals() {
+        // Only the first '=' separates the key from the value.
+        let map = parse_options("--application-name=a=b".to_string()).unwrap();
+        assert_eq!(map.get("application_name").map(String::as_str), Some("a=b"));
     }
 
     #[test]

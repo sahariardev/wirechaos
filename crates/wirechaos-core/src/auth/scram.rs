@@ -129,7 +129,7 @@ impl<'a> ScramAuthenticator<'a> {
 
         if cbind
             .as_bytes()
-            .ct_eq(&expected_cbind.as_bytes())
+            .ct_eq(expected_cbind.as_bytes())
             .unwrap_u8()
             != 1
         {
@@ -148,7 +148,14 @@ impl<'a> ScramAuthenticator<'a> {
             ));
         }
 
-        let without_proof = &client_final[..client_final.rfind(",p=").unwrap()];
+        // The proof is the last attribute of the message (RFC 5802), so the
+        // auth message is everything before it. A client-final that puts the
+        // proof anywhere else is malformed, not a reason to panic.
+        let proof_start = client_final.rfind(",p=").ok_or_else(|| {
+            ScramError::Protocol("proof attribute must follow the other attributes".into())
+        })?;
+
+        let without_proof = &client_final[..proof_start];
         let auth_message = format!(
             "{},{},{}",
             self.client_first_bare, self.server_first, without_proof
@@ -213,9 +220,10 @@ impl<'a> ScramAuthenticator<'a> {
         }
 
         if mechanism != SCRAM_SHA_256 {
-            return Err(ScramError::Protocol(
-                format!("unsupported SASL mechanism: {}", mechanism).into(),
-            ));
+            return Err(ScramError::Protocol(format!(
+                "unsupported SASL mechanism: {}",
+                mechanism
+            )));
         }
 
         Ok(())
@@ -244,9 +252,10 @@ impl<'a> ScramAuthenticator<'a> {
             }
 
             _ => {
-                return Err(ScramError::Protocol(
-                    format!("invalid gs2 flag: {}", flag).into(),
-                ))
+                return Err(ScramError::Protocol(format!(
+                    "invalid gs2 flag: {}",
+                    flag
+                )))
             }
         };
 
@@ -383,6 +392,68 @@ mod tests {
         let v = verifier();
         let auth = ScramAuthenticator::new(&v);
         assert_eq!(auth.mechanisms(), vec![SCRAM_SHA_256]);
+    }
+
+    /// The worked example from RFC 7677, section 3: password "pencil", salt
+    /// "W22ZaJ0SNY7soEsUEjb6gQ==", 4096 iterations, and the exact messages the
+    /// RFC prints.
+    ///
+    /// This checks the primitives against a published vector instead of the
+    /// crate agreeing with itself: key derivation, the ClientProof check and
+    /// the ServerSignature must all land on the RFC's bytes.
+    #[test]
+    fn ok_rfc7677_vector_derives_the_published_proof_and_signature() {
+        const RFC_PASSWORD: &str = "pencil";
+        const RFC_SALT_B64: &str = "W22ZaJ0SNY7soEsUEjb6gQ==";
+        const RFC_ITERATIONS: u32 = 4096;
+        const RFC_CLIENT_FIRST_BARE: &str = "n=user,r=rOprNGfwEbeRWgbNEkqO";
+        const RFC_SERVER_FIRST: &str = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,\
+                                        s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
+        const RFC_CLIENT_FINAL_WITHOUT_PROOF: &str =
+            "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0";
+        const RFC_PROOF_B64: &str = "dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=";
+        const RFC_SERVER_FINAL: &str = "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=";
+
+        let salt = B64.decode(RFC_SALT_B64).expect("RFC salt is base64");
+        let verifier = Verifier::from_password(RFC_PASSWORD, salt.clone(), RFC_ITERATIONS);
+
+        // SaltedPassword = PBKDF2-HMAC-SHA256, then the two derived keys.
+        let salted = pbkdf2_sha256(RFC_PASSWORD.as_bytes(), &salt, RFC_ITERATIONS);
+        let client_key = hmac_sha256(&salted, b"Client Key");
+        assert_eq!(verifier.stored_key, sha256(&client_key).to_vec());
+        assert_eq!(
+            verifier.server_key,
+            hmac_sha256(&salted, b"Server Key").to_vec()
+        );
+
+        // AuthMessage = client-first-bare + server-first + client-final-without-proof.
+        let auth_message = format!(
+            "{RFC_CLIENT_FIRST_BARE},{RFC_SERVER_FIRST},{RFC_CLIENT_FINAL_WITHOUT_PROOF}"
+        );
+
+        // The published proof XOR ClientSignature must recover ClientKey, which
+        // in turn must hash back to StoredKey.
+        let client_signature = hmac_sha256(&verifier.stored_key, auth_message.as_bytes());
+        let proof = B64.decode(RFC_PROOF_B64).expect("RFC proof is base64");
+        let recovered: Vec<u8> = proof
+            .iter()
+            .zip(client_signature.iter())
+            .map(|(a, b)| a ^ b)
+            .collect();
+        assert_eq!(
+            recovered,
+            client_key.to_vec(),
+            "the RFC's proof must recover ClientKey"
+        );
+        assert_eq!(
+            sha256(&recovered).to_vec(),
+            verifier.stored_key,
+            "the recovered ClientKey must hash to StoredKey"
+        );
+
+        // ServerSignature = HMAC(ServerKey, AuthMessage).
+        let server_signature = hmac_sha256(&verifier.server_key, auth_message.as_bytes());
+        assert_eq!(format!("v={}", B64.encode(server_signature)), RFC_SERVER_FINAL);
     }
 
     #[test]
@@ -602,6 +673,22 @@ mod tests {
                 Err(ScramError::AuthenticationFailed)
             ),
             "a proof derived from the wrong password must be rejected"
+        );
+    }
+
+    #[test]
+    fn err_proof_attribute_is_not_last() {
+        let v = verifier();
+        let mut auth = ScramAuthenticator::new(&v);
+        let server_first = begin_exchange(&mut auth);
+        let nonce = combined_nonce_of(&server_first);
+
+        // A proof in front of the other attributes must be a protocol error
+        // rather than an out-of-bounds panic while the auth message is rebuilt.
+        let message = format!("p=AAAA,c=biws,r={nonce}");
+        assert_eq!(
+            protocol_err(auth.handle_client_final(&message)),
+            "proof attribute must follow the other attributes"
         );
     }
 

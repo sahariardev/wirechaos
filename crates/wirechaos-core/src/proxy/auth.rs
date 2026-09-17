@@ -4,18 +4,31 @@ use crate::auth::verifier::VerifierProvider;
 use crate::proxy::conn::Conn;
 use crate::proxy::packet::MessageReader;
 use tokio::io;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 
 const MSG_AUTH: u8 = b'R';
 const MSG_PASSWORD: u8 = b'p';
+const MSG_ERROR: u8 = b'E';
 const AUTH_SASL: i32 = 10;
 const AUTH_SASL_CONTINUE: i32 = 11;
 const AUTH_SASL_FINAL: i32 = 12;
 impl<V: VerifierProvider> Conn<V> {
     pub async fn handle_authentication(
         &mut self,
-    ) -> Result<(Option<Vec<u8>>), Box<dyn std::error::Error>> {
-        let user = self.user.as_deref().unwrap().to_owned();
+    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+        // A startup message without a `user` cannot be authenticated, and a
+        // missing parameter must not panic the connection.
+        let user = self
+            .user
+            .clone()
+            .filter(|user| !user.is_empty())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "startup message did not provide a user",
+                )
+            })?;
+
         let verifier = self.provider.get(&user)?;
         let mut scram = ScramAuthenticator::new(&verifier);
         let mechanics = scram.mechanisms();
@@ -36,7 +49,7 @@ impl<V: VerifierProvider> Conn<V> {
             }
         };
 
-        self.send_auth_message(AUTH_SASL_CONTINUE, &server_first.as_bytes())
+        self.send_auth_message(AUTH_SASL_CONTINUE, server_first.as_bytes())
             .await?;
 
         let client_final = self.read_sasl_final_response().await?;
@@ -53,7 +66,7 @@ impl<V: VerifierProvider> Conn<V> {
             }
         };
 
-        self.send_auth_message(AUTH_SASL_FINAL, &server_final.as_bytes())
+        self.send_auth_message(AUTH_SASL_FINAL, server_final.as_bytes())
             .await?;
 
         Ok(scram.extracted_client_key().map(|k| k.to_vec()))
@@ -83,7 +96,7 @@ impl<V: VerifierProvider> Conn<V> {
             )));
         }
 
-        let message_buf = self.read_message_body(len - 4).await?;
+        let message_buf = self.read_message_body(len).await?;
 
         if message_buf.is_none() {
             return Err(Box::new(io::Error::new(
@@ -137,7 +150,7 @@ impl<V: VerifierProvider> Conn<V> {
             )));
         }
 
-        let message_buf = self.read_message_body(len - 4).await?;
+        let message_buf = self.read_message_body(len).await?;
 
         if message_buf.is_none() {
             return Err(Box::new(io::Error::new(
@@ -185,22 +198,18 @@ impl<V: VerifierProvider> Conn<V> {
             ScramError::Protocol(msg) => format!("malformed SCRAM message: {}", msg),
         };
 
-        self.buffer_writer
-            .write_all(&prepare_error_buf("FATAL", "", &msg))
+        self.write_message(MSG_ERROR, &prepare_error_buf("FATAL", "", &msg))
             .await?;
-
-        self.buffer_writer.flush().await?;
 
         Ok(())
     }
 
     async fn send_auth_failed(&mut self, user: &str) -> Result<(), Box<dyn std::error::Error>> {
         let msg = format!("password authentication failed for user \"{user}\"");
-        self.buffer_writer
-            .write_all(&prepare_error_buf("FATAL", "28P01", &msg))
+
+        self.write_message(MSG_ERROR, &prepare_error_buf("FATAL", "28P01", &msg))
             .await?;
 
-        self.buffer_writer.flush().await?;
         Ok(())
     }
 }

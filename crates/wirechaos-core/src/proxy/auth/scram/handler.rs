@@ -6,6 +6,7 @@ use crate::proxy::conn::Conn;
 use crate::proxy::packet::MessageReader;
 use tokio::io::AsyncReadExt;
 use tracing::warn;
+use crate::proxy::buffer_pool::PooledBytes;
 
 const MSG_PASSWORD: u8 = b'p';
 const AUTH_SASL: i32 = 10;
@@ -66,10 +67,7 @@ impl<V: VerifierProvider> Conn<V> {
         Ok(scram.extracted_client_key().map(|k| k.to_vec()))
     }
 
-    async fn read_sasl_initial_response(
-        &mut self,
-        mechanics: &[&str],
-    ) -> Result<(String, String), AuthFailure> {
+    async fn read_sasl_response(&mut self) -> Result<PooledBytes,AuthFailure> {
         //read first byte
         let mut buf = [0u8; 1];
         self.buffer_reader
@@ -104,6 +102,14 @@ impl<V: VerifierProvider> Conn<V> {
             )));
         };
 
+        Ok(message_buf)
+    }
+    async fn read_sasl_initial_response(
+        &mut self,
+        mechanics: &[&str],
+    ) -> Result<(String, String), AuthFailure> {
+        let message_buf = self.read_sasl_response().await?;
+
         let mut message = MessageReader::new(message_buf);
 
         let mechanism = message.read_string().map_err(AuthFailure::internal)?;
@@ -130,38 +136,7 @@ impl<V: VerifierProvider> Conn<V> {
     }
 
     async fn read_sasl_final_response(&mut self) -> Result<String, AuthFailure> {
-        let mut buf = [0u8; 1];
-        self.buffer_reader
-            .read_exact(&mut buf)
-            .await
-            .map_err(AuthFailure::internal)?;
-
-        if buf[0] != MSG_PASSWORD {
-            return Err(AuthFailure::rejected(ScramError::Protocol(
-                "invalid message type".to_owned(),
-            )));
-        }
-
-        let len = self
-            .read_message_length()
-            .await
-            .map_err(AuthFailure::internal)?;
-
-        if len < 4 {
-            return Err(AuthFailure::rejected(ScramError::Protocol(
-                "message length too short".to_owned(),
-            )));
-        }
-
-        let Some(message_buf) = self
-            .read_message_body(len)
-            .await
-            .map_err(AuthFailure::internal)?
-        else {
-            return Err(AuthFailure::rejected(ScramError::Protocol(
-                "message body empty".to_owned(),
-            )));
-        };
+        let message_buf = self.read_sasl_response().await?;
 
         String::from_utf8(message_buf.to_vec()).map_err(|_| {
             AuthFailure::rejected(ScramError::Protocol(

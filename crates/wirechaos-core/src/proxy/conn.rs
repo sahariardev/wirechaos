@@ -1,4 +1,5 @@
-use crate::auth::verifier::VerifierProvider;
+use crate::proxy::ProxyError;
+use crate::proxy::auth::verifier::VerifierProvider;
 use crate::proxy::buffer_pool::{MultiBufferPool, PooledBytes};
 use crate::proxy::conn_read::ConnRead;
 use crate::proxy::conn_write::ConnWrite;
@@ -71,11 +72,11 @@ impl<V: VerifierProvider> Conn<V> {
     /// deliberate and tracked there — the lint stays active for new code, while this
     /// known gap is visible rather than hidden.
     #[allow(clippy::todo)]
-    pub async fn handle(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn handle(&mut self) -> Result<(), ProxyError> {
         todo!("handle message: implemented in task 6 (relay engine)")
     }
 
-    pub async fn handle_startup(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn handle_startup(&mut self) -> Result<(), ProxyError> {
         let buf = self.read_startup_packet().await?;
         let mut message_reader = MessageReader::new(buf);
         let protocol_code = message_reader.read_u32()?;
@@ -111,7 +112,7 @@ impl<V: VerifierProvider> Conn<V> {
         &mut self,
         protocol_version: u32,
         message_reader: &mut MessageReader,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), ProxyError> {
         self.protocol_version = Some(protocol_version);
 
         while message_reader.remaining() > 0 {
@@ -150,7 +151,22 @@ impl<V: VerifierProvider> Conn<V> {
             self.replication_mode = replication_mode;
         }
 
-        self.handle_authentication().await?;
+        let client_key = self.handle_authentication().await?;
+
+        if client_key.is_none() {
+            // Rejected: the client has already been told why, so this is not a
+            // fault to report — it is the end of the startup phase. Returning
+            // here keeps `handle` (the relay) from ever seeing a connection
+            // whose client never authenticated.
+            //
+            // todo:: close the socket explicitly, and let the session driver
+            // distinguish "rejected" from "faulted" once it exists
+            // (doc/tasks/06-relay-engine.md).
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "authentication rejected",
+            )));
+        }
 
         Ok(())
     }
@@ -162,10 +178,10 @@ impl<V: VerifierProvider> Conn<V> {
     fn handle_cancel_request(
         &mut self,
         _message_reader: &mut MessageReader,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), ProxyError> {
         todo!("handle cancel request: implemented in task 9 (session registry)")
     }
-    async fn handle_gssnc_request(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn handle_gssnc_request(&mut self) -> Result<(), ProxyError> {
         if self.gss_done {
             return Err(Box::from("GSSENC Request is already done"));
         }
@@ -176,7 +192,7 @@ impl<V: VerifierProvider> Conn<V> {
 
         Ok(())
     }
-    async fn handle_ssl_request(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn handle_ssl_request(&mut self) -> Result<(), ProxyError> {
         if self.ssl_done {
             return Err(Box::from("SSL Request is already done"));
         }
@@ -198,7 +214,7 @@ impl<V: VerifierProvider> Conn<V> {
         Ok(())
     }
 
-    async fn promote_to_tls(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn promote_to_tls(&mut self) -> Result<(), ProxyError> {
         let reader = std::mem::replace(&mut self.buffer_reader, BufReader::new(ConnRead::Empty));
         let writer = std::mem::replace(&mut self.buffer_writer, BufWriter::new(ConnWrite::Empty));
 
@@ -230,7 +246,7 @@ impl<V: VerifierProvider> Conn<V> {
         Ok(())
     }
 
-    pub async fn read_message_length(&mut self) -> Result<usize, Box<dyn std::error::Error>> {
+    pub async fn read_message_length(&mut self) -> Result<usize, ProxyError> {
         let mut hdr = [0u8; 4];
         self.buffer_reader.read_exact(&mut hdr).await?;
         let len = u32::from_be_bytes(hdr) as usize;
@@ -245,7 +261,7 @@ impl<V: VerifierProvider> Conn<V> {
         Ok(len - 4)
     }
 
-    pub async fn read_startup_packet(&mut self) -> Result<PooledBytes, Box<dyn std::error::Error>> {
+    pub async fn read_startup_packet(&mut self) -> Result<PooledBytes, ProxyError> {
         let length = self.read_message_length().await?;
 
         if length > MAX_STARTUP_PACKET_LENGTH as usize {
@@ -267,7 +283,7 @@ impl<V: VerifierProvider> Conn<V> {
     pub async fn read_message_body(
         &mut self,
         length: usize,
-    ) -> Result<Option<PooledBytes>, Box<dyn std::error::Error>> {
+    ) -> Result<Option<PooledBytes>, ProxyError> {
         if length == 0 {
             return Ok(None);
         }
@@ -294,7 +310,7 @@ impl<V: VerifierProvider> Conn<V> {
 
     /// Write raw bytes to the peer over the current transport (plain or TLS)
     /// and flush. Used by the proxy to send protocol messages to the client.
-    pub async fn write_raw(&mut self, data: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn write_raw(&mut self, data: &[u8]) -> Result<(), ProxyError> {
         self.buffer_writer.write_all(data).await?;
         self.buffer_writer.flush().await?;
         Ok(())
@@ -304,7 +320,7 @@ impl<V: VerifierProvider> Conn<V> {
         &mut self,
         message_type: u8,
         body: &[u8],
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), ProxyError> {
         let len = (body.len() + 4) as u32;
         self.buffer_writer.write_all(&[message_type]).await?;
         self.buffer_writer.write_all(&len.to_be_bytes()).await?;

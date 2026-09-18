@@ -50,7 +50,7 @@ suspicious = { level = "warn", priority = -1 }
 perf = { level = "warn", priority = -1 }
 style = { level = "warn", priority = -1 }
 # Panicking on data that came off the wire is a bug, not a shortcut: see the
-# error taxonomy in doc/tasks/01-scram-sha-256.md and 04-startup-phase-completion.md.
+# error taxonomy in doc/tasks/01-scram_authenticator-sha-256.md and 04-startup-phase-completion.md.
 unwrap_used = "deny"
 expect_used = "deny"
 panic_in_result_fn = "warn"

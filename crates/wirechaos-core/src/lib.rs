@@ -1,4 +1,3 @@
-pub mod auth;
 mod observability;
 pub mod proxy;
 

@@ -1,3 +1,4 @@
+use crate::proxy::ProxyError;
 use crate::proxy::buffer_pool::PooledBytes;
 
 pub struct MessageReader {
@@ -19,7 +20,7 @@ impl MessageReader {
     /// Part of the typed message model: unused until the protocol engine reads
     /// single-byte fields (doc/tasks/13-protocol-message-model.md).
     #[allow(dead_code)]
-    pub fn read_byte(&mut self) -> Result<u8, Box<dyn std::error::Error>> {
+    pub fn read_byte(&mut self) -> Result<u8, ProxyError> {
         if self.remaining() == 0 {
             return Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -40,7 +41,7 @@ impl MessageReader {
     /// `Int16` fields such as `RowDescription` column counts
     /// (doc/tasks/13-protocol-message-model.md).
     #[allow(dead_code)]
-    pub fn read_u16(&mut self) -> Result<u16, Box<dyn std::error::Error>> {
+    pub fn read_u16(&mut self) -> Result<u16, ProxyError> {
         if self.remaining() < 2 {
             return Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -55,7 +56,7 @@ impl MessageReader {
         Ok(value)
     }
 
-    pub fn read_u32(&mut self) -> Result<u32, Box<dyn std::error::Error>> {
+    pub fn read_u32(&mut self) -> Result<u32, ProxyError> {
         if self.remaining() < 4 {
             return Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -75,7 +76,7 @@ impl MessageReader {
         Ok(value)
     }
 
-    pub fn read_string(&mut self) -> Result<String, Box<dyn std::error::Error>> {
+    pub fn read_string(&mut self) -> Result<String, ProxyError> {
         let start = self.pos;
 
         while self.pos < self.buf.len() {
@@ -97,7 +98,7 @@ impl MessageReader {
     pub fn read_string_fixed_size(
         &mut self,
         size: i32,
-    ) -> Result<String, Box<dyn std::error::Error>> {
+    ) -> Result<String, ProxyError> {
         if self.remaining() < size as usize {
             return Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,

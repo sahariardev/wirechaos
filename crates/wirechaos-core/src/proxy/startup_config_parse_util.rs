@@ -1,3 +1,4 @@
+use crate::proxy::ProxyError;
 use crate::proxy::replication_mode::ReplicationMode;
 use crate::proxy::replication_mode::ReplicationMode::{Logical, Off};
 use std::collections::HashMap;
@@ -5,7 +6,7 @@ use tokio::io;
 
 pub fn parse_options(
     options: String,
-) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
+) -> Result<HashMap<String, String>, ProxyError> {
     let tokens = split_option_tokens(options);
     let mut result: HashMap<String, String> = HashMap::new();
     let mut i = 0;
@@ -57,7 +58,7 @@ pub fn parse_options(
     Ok(result)
 }
 
-fn split_key_value(token: &str) -> Result<(&str, &str), Box<dyn std::error::Error>> {
+fn split_key_value(token: &str) -> Result<(&str, &str), ProxyError> {
     let (key, value) = token
         .split_once('=')
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid key/value size"))?;
@@ -108,7 +109,7 @@ pub fn split_option_tokens(s: String) -> Vec<String> {
 
 pub fn parse_replication_mode(
     value: String,
-) -> Result<ReplicationMode, Box<dyn std::error::Error>> {
+) -> Result<ReplicationMode, ProxyError> {
     match value.to_lowercase().as_str() {
         "" | "false" | "off" | "no" | "0" | "f" | "n" => Ok(Off),
         "true" | "on" | "yes" | "1" | "t" | "y" => Ok(ReplicationMode::Physical),

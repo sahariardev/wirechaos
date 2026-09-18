@@ -1,8 +1,30 @@
+use crate::proxy::auth::error::AuthError;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
+use std::error::Error;
+
+#[derive(Debug)]
+pub enum ProviderError {}
+impl Error for ProviderError {}
+
+impl AuthError for ProviderError {
+    fn code(&self) -> &str {
+        "08P01"
+    }
+
+    fn message(&self) -> &str {
+        "Invalid auth provider"
+    }
+}
+
+impl std::fmt::Display for ProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message())
+    }
+}
 
 pub trait VerifierProvider {
-    fn get(&self, username: &str) -> Result<Verifier, Box<dyn std::error::Error>>;
+    fn lookup(&self, username: &str) -> Result<Option<Verifier>, ProviderError>;
 }
 
 #[derive(Clone)]

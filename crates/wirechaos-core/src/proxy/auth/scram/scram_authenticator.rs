@@ -1,5 +1,5 @@
-use crate::auth::error::ScramError;
-use crate::auth::verifier::{hmac_sha256, sha256, Verifier};
+use crate::proxy::auth::scram::error::ScramError;
+use crate::proxy::auth::verifier::{hmac_sha256, sha256, Verifier};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use rand::RngCore;
 use subtle::ConstantTimeEq;
@@ -261,7 +261,7 @@ impl<'a> ScramAuthenticator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::verifier::{hmac_sha256, pbkdf2_sha256, sha256, Verifier};
+    use crate::proxy::auth::verifier::{hmac_sha256, pbkdf2_sha256, sha256, Verifier};
     use base64::{engine::general_purpose::STANDARD as B64, Engine};
 
     const USER: &str = "user";

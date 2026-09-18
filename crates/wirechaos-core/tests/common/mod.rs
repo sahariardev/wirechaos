@@ -20,8 +20,8 @@ use rustls::{Certificate, PrivateKey, RootCertStore, ServerConfig, ServerName};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
-use wirechaos_core::auth::verifier::{
-    hmac_sha256, pbkdf2_sha256, sha256, Verifier, VerifierProvider,
+use wirechaos_core::proxy::auth::verifier::{
+    hmac_sha256, pbkdf2_sha256, sha256, ProviderError, Verifier, VerifierProvider,
 };
 use wirechaos_core::proxy::buffer_pool::MultiBufferPool;
 
@@ -135,7 +135,7 @@ impl TestVerifierProvider {
         Self { users }
     }
 
-    /// A provider that knows nobody: every lookup fails.
+    /// A provider that knows nobody: every lookup misses.
     pub fn empty() -> Self {
         Self {
             users: HashMap::new(),
@@ -144,11 +144,11 @@ impl TestVerifierProvider {
 }
 
 impl VerifierProvider for TestVerifierProvider {
-    fn get(&self, username: &str) -> Result<Verifier, Box<dyn std::error::Error>> {
-        self.users
-            .get(username)
-            .cloned()
-            .ok_or_else(|| format!("unknown user \"{username}\"").into())
+    /// `Ok(None)` is the "no such user" answer; `Err` is reserved for a store
+    /// that could not be consulted. `ProviderError` currently has no variants,
+    /// so a store failure cannot be simulated from here yet.
+    fn lookup(&self, username: &str) -> Result<Option<Verifier>, ProviderError> {
+        Ok(self.users.get(username).cloned())
     }
 }
 

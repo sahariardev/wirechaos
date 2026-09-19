@@ -198,6 +198,17 @@ impl<'a> ScramAuthenticator<'a> {
             )));
         }
 
+        // if user does not exist we continue the scram auth with dummy verifier
+        // to make sure to execute all the hashing so that it prevents attacker to
+        // identify user does not exist, once all kind of hasing operation done we are sending
+        // auth failed
+        if self.verifier.dummy {
+            return Err(ScramError::AuthenticationFailed(format!(
+                "password authentication failed for user {}",
+                user
+            )));
+        }
+
         self.extracted_client_key = Some(recovered_client_key);
 
         let server_sig = hmac_sha256(&self.verifier.server_key, auth_message.as_bytes());

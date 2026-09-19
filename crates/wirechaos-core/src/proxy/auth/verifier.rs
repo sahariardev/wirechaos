@@ -25,6 +25,7 @@ impl std::fmt::Display for ProviderError {
 
 pub trait VerifierProvider {
     fn lookup(&self, username: &str) -> Result<Option<Verifier>, ProviderError>;
+    fn get_dummy_verifier(&self) -> Result<Verifier, ProviderError>;
 }
 
 #[derive(Clone)]
@@ -33,6 +34,7 @@ pub struct Verifier {
     pub salt: Vec<u8>,
     pub stored_key: Vec<u8>,
     pub server_key: Vec<u8>,
+    pub dummy: bool
 }
 
 impl Verifier {
@@ -47,6 +49,7 @@ impl Verifier {
             salt,
             stored_key: stored_key.to_vec(),
             server_key: server_key.to_vec(),
+            dummy: false
         }
     }
 }

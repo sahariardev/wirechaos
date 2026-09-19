@@ -2,11 +2,11 @@ use crate::proxy::auth::error::AuthFailure;
 use crate::proxy::auth::scram::error::ScramError;
 use crate::proxy::auth::scram::scram_authenticator::ScramAuthenticator;
 use crate::proxy::auth::verifier::VerifierProvider;
+use crate::proxy::buffer_pool::PooledBytes;
 use crate::proxy::conn::Conn;
 use crate::proxy::packet::MessageReader;
 use tokio::io::AsyncReadExt;
 use tracing::warn;
-use crate::proxy::buffer_pool::PooledBytes;
 
 const MSG_PASSWORD: u8 = b'p';
 const AUTH_SASL: i32 = 10;
@@ -29,13 +29,15 @@ impl<V: VerifierProvider> Conn<V> {
         let verifier = match self.provider.lookup(&user) {
             Ok(Some(verifier)) => verifier,
             Ok(None) => {
-                // The client is answered exactly as for a wrong password, but
-                // the two must stay distinguishable on the server side. `?user`
-                // escapes it: the name came off the wire.
-                warn!(user = ?user, "authentication rejected: unknown user");
-                return Err(AuthFailure::rejected(ScramError::AuthenticationFailed(
-                    format!("password authentication failed for user {}", user),
-                )));
+                //if user does not exist, then continue to scram auth with dummy verifier
+                let dummy = match self.provider.get_dummy_verifier() {
+                    Ok(val) => val,
+                    Err(e) => {
+                        return Err(AuthFailure::rejected(e));
+                    }
+                };
+
+                dummy
             }
             Err(e) => {
                 // A credential-store fault, not a client mistake — it gets its
@@ -78,7 +80,7 @@ impl<V: VerifierProvider> Conn<V> {
         Ok(scram.extracted_client_key().map(|k| k.to_vec()))
     }
 
-    async fn read_sasl_response(&mut self) -> Result<PooledBytes,AuthFailure> {
+    async fn read_sasl_response(&mut self) -> Result<PooledBytes, AuthFailure> {
         //read first byte
         let mut buf = [0u8; 1];
         self.buffer_reader
@@ -139,11 +141,9 @@ impl<V: VerifierProvider> Conn<V> {
             )));
         }
 
-        let client_first = message
-            .read_string_fixed_size(data_len)
-            .map_err(|_| AuthFailure::rejected(ScramError::Protocol(
-                "Invalid message".to_owned(),
-            )))?;
+        let client_first = message.read_string_fixed_size(data_len).map_err(|_| {
+            AuthFailure::rejected(ScramError::Protocol("Invalid message".to_owned()))
+        })?;
 
         Ok((mechanism, client_first))
     }
@@ -152,9 +152,7 @@ impl<V: VerifierProvider> Conn<V> {
         let message_buf = self.read_sasl_response().await?;
 
         String::from_utf8(message_buf.to_vec()).map_err(|_| {
-            AuthFailure::rejected(ScramError::Protocol(
-                "malformed SCRAM message".to_owned(),
-            ))
+            AuthFailure::rejected(ScramError::Protocol("malformed SCRAM message".to_owned()))
         })
     }
 

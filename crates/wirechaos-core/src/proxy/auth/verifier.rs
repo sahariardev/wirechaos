@@ -9,11 +9,11 @@ impl Error for ProviderError {}
 
 impl AuthError for ProviderError {
     fn code(&self) -> &str {
-        "08P01"
+        "08006"
     }
 
     fn message(&self) -> &str {
-        "Invalid auth provider"
+        "temporarily unavailable"
     }
 }
 

@@ -12,6 +12,7 @@ const MSG_PASSWORD: u8 = b'p';
 const AUTH_SASL: i32 = 10;
 const AUTH_SASL_CONTINUE: i32 = 11;
 const AUTH_SASL_FINAL: i32 = 12;
+const AUTH_SASL_OK: i32 = 0;
 
 impl<V: VerifierProvider> Conn<V> {
     pub async fn handle_scram_auth(&mut self) -> Result<Option<Vec<u8>>, AuthFailure> {
@@ -19,7 +20,11 @@ impl<V: VerifierProvider> Conn<V> {
             .user
             .clone()
             .filter(|user| !user.is_empty())
-            .ok_or_else(|| AuthFailure::rejected(ScramError::AuthenticationFailed))?;
+            .ok_or_else(|| {
+                AuthFailure::rejected(ScramError::AuthenticationFailed(
+                    "password authentication failed for user".to_string(),
+                ))
+            })?;
 
         let verifier = match self.provider.lookup(&user) {
             Ok(Some(verifier)) => verifier,
@@ -28,7 +33,9 @@ impl<V: VerifierProvider> Conn<V> {
                 // the two must stay distinguishable on the server side. `?user`
                 // escapes it: the name came off the wire.
                 warn!(user = ?user, "authentication rejected: unknown user");
-                return Err(AuthFailure::rejected(ScramError::AuthenticationFailed));
+                return Err(AuthFailure::rejected(ScramError::AuthenticationFailed(
+                    format!("password authentication failed for user {}", user),
+                )));
             }
             Err(e) => {
                 // A credential-store fault, not a client mistake — it gets its
@@ -57,10 +64,14 @@ impl<V: VerifierProvider> Conn<V> {
         let client_final = self.read_sasl_final_response().await?;
 
         let server_final = scram
-            .handle_client_final(&client_final)
+            .handle_client_final(&client_final, &user)
             .map_err(AuthFailure::rejected)?;
 
         self.send_auth_message(AUTH_SASL_FINAL, server_final.as_bytes())
+            .await
+            .map_err(AuthFailure::internal)?;
+
+        self.send_auth_message(AUTH_SASL_OK, &[])
             .await
             .map_err(AuthFailure::internal)?;
 
@@ -116,7 +127,7 @@ impl<V: VerifierProvider> Conn<V> {
 
         if !mechanics.contains(&mechanism.as_str()) {
             return Err(AuthFailure::rejected(ScramError::Protocol(
-                "message body empty".to_owned(),
+                "invalid mechanism".to_owned(),
             )));
         }
 
@@ -124,13 +135,15 @@ impl<V: VerifierProvider> Conn<V> {
 
         if data_len < 0 {
             return Err(AuthFailure::rejected(ScramError::Protocol(
-                "message too short".to_owned(),
+                "Invalid message".to_owned(),
             )));
         }
 
         let client_first = message
             .read_string_fixed_size(data_len)
-            .map_err(AuthFailure::internal)?;
+            .map_err(|_| AuthFailure::rejected(ScramError::Protocol(
+                "Invalid message".to_owned(),
+            )))?;
 
         Ok((mechanism, client_first))
     }

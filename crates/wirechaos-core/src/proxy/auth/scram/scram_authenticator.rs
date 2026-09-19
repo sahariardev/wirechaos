@@ -11,6 +11,19 @@ enum State {
     Done,
 }
 
+/// The message every malformed SCRAM message is rejected with.
+///
+/// Security: the text is deliberately uniform and says nothing about which
+/// attribute was missing, which check failed, or how far the parser got.
+/// Naming the failing check would let a probe map the parser just by reading
+/// the error text it gets back, so the client only ever learns that its message
+/// was rejected. The one message allowed to say more is the authentication
+/// failure in `handle_client_final`, which must read the same for every bad
+/// credential.
+fn malformed() -> ScramError {
+    ScramError::Protocol("malformed SCRAM message".to_string())
+}
+
 pub const SCRAM_SHA_256: &str = "SCRAM-SHA-256";
 pub const SERVER_NONCE_LENGTH: usize = 32;
 pub struct ScramAuthenticator<'a> {
@@ -66,7 +79,7 @@ impl<'a> ScramAuthenticator<'a> {
         }
 
         if client_nonce.is_empty() {
-            return Err(ScramError::Protocol("missing client nonce".to_string()));
+            return Err(malformed());
         }
 
         let mut server_nonce_bytes = [0u8; SERVER_NONCE_LENGTH];
@@ -89,9 +102,13 @@ impl<'a> ScramAuthenticator<'a> {
         Ok(server_first)
     }
 
-    pub fn handle_client_final(&mut self, client_final: &str) -> Result<String, ScramError> {
+    pub fn handle_client_final(
+        &mut self,
+        client_final: &str,
+        user: &str,
+    ) -> Result<String, ScramError> {
         if self.state != State::ClientFirstReceived {
-            return Err(ScramError::Protocol("unexpected client-final".into()));
+            return Err(malformed());
         }
 
         self.state = State::Done;
@@ -101,29 +118,29 @@ impl<'a> ScramAuthenticator<'a> {
         for attr in client_final.split(',') {
             if let Some(v) = attr.strip_prefix("c=") {
                 if cbind.is_some() {
-                    return Err(ScramError::Protocol("duplicate cbind attribute".into()));
+                    return Err(malformed());
                 }
                 cbind = Some(v);
             }
 
             if let Some(v) = attr.strip_prefix("r=") {
                 if nonce.is_some() {
-                    return Err(ScramError::Protocol("duplicate nonce attribute".into()));
+                    return Err(malformed());
                 }
                 nonce = Some(v);
             }
 
             if let Some(v) = attr.strip_prefix("p=") {
                 if proof_b64.is_some() {
-                    return Err(ScramError::Protocol("duplicate proof attribute".into()));
+                    return Err(malformed());
                 }
                 proof_b64 = Some(v);
             }
         }
 
-        let cbind = cbind.ok_or_else(|| ScramError::Protocol("missing c=".into()))?;
-        let nonce = nonce.ok_or_else(|| ScramError::Protocol("missing r=".into()))?;
-        let proof_b64 = proof_b64.ok_or_else(|| ScramError::Protocol("missing p=".into()))?;
+        let cbind = cbind.ok_or_else(malformed)?;
+        let nonce = nonce.ok_or_else(malformed)?;
+        let proof_b64 = proof_b64.ok_or_else(malformed)?;
 
         let expected_cbind = B64.encode(self.gs2_header.as_bytes());
 
@@ -133,27 +150,21 @@ impl<'a> ScramAuthenticator<'a> {
             .unwrap_u8()
             != 1
         {
-            return Err(ScramError::Protocol("channel binding check failed".into()));
+            return Err(malformed());
         }
 
         if nonce != self.combined_nonce {
-            return Err(ScramError::Protocol(
-                "nonce mismatch (possible replay)".into(),
-            ));
+            return Err(malformed());
         }
 
         if !nonce.starts_with(&self.client_nonce) {
-            return Err(ScramError::Protocol(
-                "combined nonce lost client prefix".into(),
-            ));
+            return Err(malformed());
         }
 
         // The proof is the last attribute of the message (RFC 5802), so the
         // auth message is everything before it. A client-final that puts the
         // proof anywhere else is malformed, not a reason to panic.
-        let proof_start = client_final.rfind(",p=").ok_or_else(|| {
-            ScramError::Protocol("proof attribute must follow the other attributes".into())
-        })?;
+        let proof_start = client_final.rfind(",p=").ok_or_else(malformed)?;
 
         let without_proof = &client_final[..proof_start];
         let auth_message = format!(
@@ -161,12 +172,10 @@ impl<'a> ScramAuthenticator<'a> {
             self.client_first_bare, self.server_first, without_proof
         );
 
-        let proof = B64
-            .decode(proof_b64)
-            .map_err(|_| ScramError::Protocol("proof is not valid base64".into()))?;
+        let proof = B64.decode(proof_b64).map_err(|_| malformed())?;
 
         if proof.len() != 32 {
-            return Err(ScramError::Protocol("proof must be 32 bytes".into()));
+            return Err(malformed());
         }
 
         let client_sig = hmac_sha256(&self.verifier.stored_key, auth_message.as_bytes());
@@ -183,7 +192,10 @@ impl<'a> ScramAuthenticator<'a> {
             .unwrap_u8()
             != 1
         {
-            return Err(ScramError::AuthenticationFailed);
+            return Err(ScramError::AuthenticationFailed(format!(
+                "password authentication failed for user {}",
+                user
+            )));
         }
 
         self.extracted_client_key = Some(recovered_client_key);
@@ -202,7 +214,7 @@ impl<'a> ScramAuthenticator<'a> {
                 "client uses authorization identity, but it is not supported ".into(),
             ));
         } else if !authzid_part.is_empty() && !authzid_part.starts_with("a=") {
-            return Err(ScramError::Protocol("malformed authzid".into()));
+            return Err(malformed());
         }
 
         Ok(())
@@ -210,7 +222,7 @@ impl<'a> ScramAuthenticator<'a> {
 
     fn validate_params(&self, mechanism: &str, startup_user: &str) -> Result<(), ScramError> {
         if self.state != State::Started {
-            return Err(ScramError::Protocol("unexpected client first".into()));
+            return Err(malformed());
         }
 
         if startup_user.is_empty() {
@@ -235,9 +247,7 @@ impl<'a> ScramAuthenticator<'a> {
         let parts: Vec<&str> = client_first.splitn(3, ',').collect();
 
         if parts.len() < 3 {
-            return Err(ScramError::Protocol(
-                "client-first-message needs >= 3 comma parts".into(),
-            ));
+            return Err(malformed());
         }
 
         Ok((parts[0], parts[1], parts[2]))
@@ -251,7 +261,7 @@ impl<'a> ScramAuthenticator<'a> {
                 ))
             }
 
-            _ => return Err(ScramError::Protocol(format!("invalid gs2 flag: {}", flag))),
+            _ => return Err(malformed()),
         };
 
         Ok(())
@@ -282,16 +292,35 @@ mod tests {
         }
     }
 
-    /// Pull the message out of a Protocol error (the only error `handle_client_first`
-    /// currently returns), panicking otherwise.
+    /// The client-visible text for a rejected SCRAM message. Written out as a
+    /// literal on purpose: this is the wire contract, so the test must fail if
+    /// the message ever starts describing the failure instead of merely naming
+    /// it.
+    const OPAQUE: &str = "malformed SCRAM message";
+
+    /// Pull the message out of a Protocol error, panicking otherwise.
     fn protocol_err(result: Result<String, ScramError>) -> String {
         match result {
             Err(ScramError::Protocol(message)) => message,
-            Err(ScramError::AuthenticationFailed) => {
+            Err(ScramError::AuthenticationFailed(_)) => {
                 panic!("expected Protocol error, got AuthenticationFailed")
             }
             Ok(_) => panic!("expected error, got Ok"),
         }
+    }
+
+    /// Assert that the client's message was rejected as malformed.
+    ///
+    /// Every malformed SCRAM message answers with the same opaque text, so a
+    /// test can only pin that the input *is* rejected — which is the point: the
+    /// text must never tell a prober which check it reached. The input differs
+    /// from test to test; the answer may not. The few messages that are still
+    /// specific (an unoffered mechanism, an unsupported authorization identity,
+    /// channel binding the server never offered, an empty startup user) say
+    /// what the client asked for, not how far its parser input got, and keep
+    /// their own assertions.
+    fn assert_malformed(result: Result<String, ScramError>) {
+        assert_eq!(protocol_err(result), OPAQUE);
     }
 
     /// Parse the `r=...` combined nonce out of a server-first message.
@@ -382,7 +411,7 @@ mod tests {
 
         let (client_final, expected_server_final) =
             simulate_client(password, &client_first_bare, &server_first, gs2_header);
-        let server_final = expect_ok(auth.handle_client_final(&client_final));
+        let server_final = expect_ok(auth.handle_client_final(&client_final, ""));
         (server_final, expected_server_final)
     }
 
@@ -514,8 +543,7 @@ mod tests {
 
         // A second client-first is a protocol violation: we've already moved to
         // ClientFirstReceived.
-        let err = protocol_err(auth.handle_client_first(SCRAM_SHA_256, &client_first, USER));
-        assert_eq!(err, "unexpected client first");
+        assert_malformed(auth.handle_client_first(SCRAM_SHA_256, &client_first, USER));
     }
 
     #[test]
@@ -524,8 +552,7 @@ mod tests {
         let mut auth = ScramAuthenticator::new(&v);
 
         // Parsing failure leaves state untouched (still Started), so a retry works.
-        let err = protocol_err(auth.handle_client_first(SCRAM_SHA_256, "n,", USER));
-        assert_eq!(err, "client-first-message needs >= 3 comma parts");
+        assert_malformed(auth.handle_client_first(SCRAM_SHA_256, "n,", USER));
 
         let ok = auth.handle_client_first(
             SCRAM_SHA_256,
@@ -541,16 +568,14 @@ mod tests {
         let mut auth = ScramAuthenticator::new(&v);
         // Valid gs2 header, but the bare part carries no r= attribute.
         let client_first = format!("n,,n={USER}");
-        let err = protocol_err(auth.handle_client_first(SCRAM_SHA_256, &client_first, USER));
-        assert_eq!(err, "missing client nonce");
+        assert_malformed(auth.handle_client_first(SCRAM_SHA_256, &client_first, USER));
     }
 
     #[test]
     fn err_fewer_than_three_comma_parts() {
         let v = verifier();
         let mut auth = ScramAuthenticator::new(&v);
-        let err = protocol_err(auth.handle_client_first(SCRAM_SHA_256, "n,", USER));
-        assert_eq!(err, "client-first-message needs >= 3 comma parts");
+        assert_malformed(auth.handle_client_first(SCRAM_SHA_256, "n,", USER));
     }
 
     #[test]
@@ -588,8 +613,7 @@ mod tests {
         let v = verifier();
         let mut auth = ScramAuthenticator::new(&v);
         let client_first = format!("x,,n={USER},r={CLIENT_NONCE}");
-        let err = protocol_err(auth.handle_client_first(SCRAM_SHA_256, &client_first, USER));
-        assert_eq!(err, "invalid gs2 flag: x");
+        assert_malformed(auth.handle_client_first(SCRAM_SHA_256, &client_first, USER));
     }
 
     #[test]
@@ -608,8 +632,7 @@ mod tests {
         let mut auth = ScramAuthenticator::new(&v);
         // Anything between the gs2 commas that isn't empty and doesn't start with "a=".
         let client_first = format!("n,zz,n={USER},r={CLIENT_NONCE}");
-        let err = protocol_err(auth.handle_client_first(SCRAM_SHA_256, &client_first, USER));
-        assert_eq!(err, "malformed authzid");
+        assert_malformed(auth.handle_client_first(SCRAM_SHA_256, &client_first, USER));
     }
 
     #[test]
@@ -660,8 +683,7 @@ mod tests {
         let mut auth = ScramAuthenticator::new(&v);
         let (_, _) = full_client_exchange(&mut auth, "pencil", "n,,", CLIENT_NONCE);
 
-        let err = protocol_err(auth.handle_client_final("c=biws,r=x,p=AAAA"));
-        assert_eq!(err, "unexpected client-final");
+        assert_malformed(auth.handle_client_final("c=biws,r=x,p=AAAA", ""));
     }
 
     #[test]
@@ -675,8 +697,8 @@ mod tests {
 
         assert!(
             matches!(
-                auth.handle_client_final(&client_final),
-                Err(ScramError::AuthenticationFailed)
+                auth.handle_client_final(&client_final, ""),
+                Err(ScramError::AuthenticationFailed(_))
             ),
             "a proof derived from the wrong password must be rejected"
         );
@@ -692,10 +714,7 @@ mod tests {
         // A proof in front of the other attributes must be a protocol error
         // rather than an out-of-bounds panic while the auth message is rebuilt.
         let message = format!("p=AAAA,c=biws,r={nonce}");
-        assert_eq!(
-            protocol_err(auth.handle_client_final(&message)),
-            "proof attribute must follow the other attributes"
-        );
+        assert_malformed(auth.handle_client_final(&message, ""));
     }
 
     #[test]
@@ -703,45 +722,39 @@ mod tests {
         let v = verifier();
         let mut auth = ScramAuthenticator::new(&v);
         // handle_client_final before any client-first.
-        let err = protocol_err(auth.handle_client_final("c=biws,r=x,p=AAAA"));
-        assert_eq!(err, "unexpected client-final");
+        assert_malformed(auth.handle_client_final("c=biws,r=x,p=AAAA", ""));
     }
 
     #[test]
     fn err_required_attributes_missing() {
         let v = verifier();
-        let mut auth = ScramAuthenticator::new(&v);
-        begin_exchange(&mut auth);
 
-        // Missing-attribute checks run before the nonce is validated, so the
-        // attribute values here only need to be syntactically parseable.
-        let cases = [
-            ("r=x,p=AAAA", "missing c="),
-            ("c=biws,p=AAAA", "missing r="),
-            ("c=biws,r=x", "missing p="),
-        ];
-        for (message, expected) in cases {
+        // One case per required attribute. Which one is absent is never told to
+        // the client, so each case only has to show the message is rejected.
+        // The checks run before the nonce is validated, so the attribute values
+        // here only need to be syntactically parseable.
+        let cases = ["r=x,p=AAAA", "c=biws,p=AAAA", "c=biws,r=x"];
+        for message in cases {
             let mut auth = ScramAuthenticator::new(&v);
             begin_exchange(&mut auth);
-            assert_eq!(protocol_err(auth.handle_client_final(message)), expected);
+            assert_malformed(auth.handle_client_final(message, ""));
         }
     }
 
     #[test]
     fn err_duplicate_attributes() {
         let v = verifier();
-        let mut auth = ScramAuthenticator::new(&v);
-        begin_exchange(&mut auth);
 
+        // One case per attribute that may appear at most once.
         let cases = [
-            ("c=biws,c=biws,r=x,p=AAAA", "duplicate cbind attribute"),
-            ("c=biws,r=x,r=y,p=AAAA", "duplicate nonce attribute"),
-            ("c=biws,r=x,p=AAAA,p=BBBB", "duplicate proof attribute"),
+            "c=biws,c=biws,r=x,p=AAAA",
+            "c=biws,r=x,r=y,p=AAAA",
+            "c=biws,r=x,p=AAAA,p=BBBB",
         ];
-        for (message, expected) in cases {
+        for message in cases {
             let mut auth = ScramAuthenticator::new(&v);
             begin_exchange(&mut auth);
-            assert_eq!(protocol_err(auth.handle_client_final(message)), expected);
+            assert_malformed(auth.handle_client_final(message, ""));
         }
     }
 
@@ -753,8 +766,7 @@ mod tests {
 
         // cbind is base64 of "y,," ("eSws") instead of the echoed "n,," ("biws").
         let client_final = "c=eSws,r=x,p=AAAA";
-        let err = protocol_err(auth.handle_client_final(client_final));
-        assert_eq!(err, "channel binding check failed");
+        assert_malformed(auth.handle_client_final(client_final, ""));
     }
 
     #[test]
@@ -766,33 +778,29 @@ mod tests {
 
         // Drop the last character of the real combined nonce.
         let truncated = format!("c=biws,r={},p=AAAA", &combined[..combined.len() - 1]);
-        let err = protocol_err(auth.handle_client_final(&truncated));
-        assert_eq!(err, "nonce mismatch (possible replay)");
+        assert_malformed(auth.handle_client_final(&truncated, ""));
 
         // A completely different nonce.
         let mut auth = ScramAuthenticator::new(&v);
         begin_exchange(&mut auth);
-        let err = protocol_err(auth.handle_client_final("c=biws,r=totally-different,p=AAAA"));
-        assert_eq!(err, "nonce mismatch (possible replay)");
+        assert_malformed(auth.handle_client_final("c=biws,r=totally-different,p=AAAA", ""));
     }
 
     #[test]
     fn err_malformed_proof() {
-        // Both malformed-proof cases are only reached after the nonce check, so
-        // each case runs its own exchange and derives its own combined nonce.
-        let cases: [(&str, &str); 2] = [
-            ("!!!not-base64!!!", "proof is not valid base64"),
-            // Valid base64 but the wrong length (16 bytes, not 32).
-            (&B64.encode(vec![0u8; 16]), "proof must be 32 bytes"),
-        ];
+        // A payload that is not base64 at all, and one that is valid base64 but
+        // decodes to the wrong length (16 bytes, not 32). Both are only reached
+        // after the nonce check, so each case runs its own exchange and derives
+        // its own combined nonce.
+        let cases = ["!!!not-base64!!!".to_string(), B64.encode(vec![0u8; 16])];
 
-        for (payload, expected) in cases {
+        for payload in cases {
             let v = verifier();
             let mut auth = ScramAuthenticator::new(&v);
             let server_first = begin_exchange(&mut auth);
             let nonce = combined_nonce_of(&server_first);
             let message = format!("c=biws,r={nonce},p={payload}");
-            assert_eq!(protocol_err(auth.handle_client_final(&message)), expected);
+            assert_malformed(auth.handle_client_final(&message, ""));
         }
     }
 }

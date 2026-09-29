@@ -22,7 +22,7 @@ use wirechaos_core::proxy::conn::Conn;
 /// echo a fixed reply — all over the promoted TLS transport.
 #[tokio::test]
 async fn ssl_request_promotes_connection_to_tls() {
-    let (acceptor, connector) = tls_pair();
+    let (frontend_tls, connector) = tls_pair();
     let pool = buffer_pool();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -30,7 +30,7 @@ async fn ssl_request_promotes_connection_to_tls() {
 
     let server = tokio::spawn(async move {
         let (socket, _peer) = listener.accept().await.expect("accept");
-        let mut conn = Conn::new(socket, pool, Some(acceptor), TestVerifierProvider::new());
+        let mut conn = Conn::new(socket, pool, Some(frontend_tls), TestVerifierProvider::new());
 
         // First call: read the SSLRequest, reply 'S', upgrade to TLS.
         conn.handle_startup()
@@ -305,7 +305,7 @@ async fn startup_is_rejected_when_tls_is_required() {
 /// connection: SSLRequest + TLS + startup + SCRAM must all succeed.
 #[tokio::test]
 async fn startup_over_tls_is_accepted_when_tls_is_required() {
-    let (acceptor, connector) = tls_pair();
+    let (frontend_tls, connector) = tls_pair();
     let pool = buffer_pool();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -313,7 +313,7 @@ async fn startup_over_tls_is_accepted_when_tls_is_required() {
 
     let server = tokio::spawn(async move {
         let (socket, _peer) = listener.accept().await.expect("accept");
-        let mut conn = Conn::new(socket, pool, Some(acceptor), TestVerifierProvider::new());
+        let mut conn = Conn::new(socket, pool, Some(frontend_tls), TestVerifierProvider::new());
         conn.required_tls = true;
 
         // SSLRequest: reply 'S' and promote to TLS.

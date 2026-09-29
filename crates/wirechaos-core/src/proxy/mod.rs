@@ -9,3 +9,4 @@ mod replication_mode;
 pub mod server;
 pub mod startup_config_parse_util;
 pub mod auth;
+pub mod tls;

@@ -30,14 +30,12 @@ impl<V: VerifierProvider> Conn<V> {
             Ok(Some(verifier)) => verifier,
             Ok(None) => {
                 //if user does not exist, then continue to scram auth with dummy verifier
-                let dummy = match self.provider.get_dummy_verifier() {
-                    Ok(val) => val,
+                match self.provider.get_dummy_verifier() {
+                    Ok(verifier) => verifier,
                     Err(e) => {
                         return Err(AuthFailure::rejected(e));
                     }
-                };
-
-                dummy
+                }
             }
             Err(e) => {
                 // A credential-store fault, not a client mistake — it gets its
@@ -47,7 +45,18 @@ impl<V: VerifierProvider> Conn<V> {
             }
         };
 
-        let mut scram = ScramAuthenticator::new(&verifier);
+        // `-PLUS` may only be offered when the client actually upgraded to TLS
+        // *and* our certificate has a defined RFC 5929 hash. Passing `None`
+        // otherwise keeps `mechanisms()` honest on plaintext connections.
+        let cert_hash = if self.ssl_done {
+            self.frontend_tls
+                .as_ref()
+                .and_then(|tls| tls.cert_hash.clone())
+        } else {
+            None
+        };
+
+        let mut scram = ScramAuthenticator::new(&verifier, cert_hash);
         let mechanics = scram.mechanisms();
 
         self.send_auth_sasl(&mechanics)

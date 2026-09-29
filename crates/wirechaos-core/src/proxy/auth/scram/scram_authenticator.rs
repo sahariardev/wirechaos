@@ -1,5 +1,6 @@
 use crate::proxy::auth::scram::error::ScramError;
 use crate::proxy::auth::verifier::{hmac_sha256, sha256, Verifier};
+use crate::proxy::tls::CertHash;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use rand::RngCore;
 use subtle::ConstantTimeEq;
@@ -25,6 +26,7 @@ fn malformed() -> ScramError {
 }
 
 pub const SCRAM_SHA_256: &str = "SCRAM-SHA-256";
+pub const PLUS: &str = "-PLUS";
 pub const SERVER_NONCE_LENGTH: usize = 32;
 pub struct ScramAuthenticator<'a> {
     verifier: &'a Verifier,
@@ -35,10 +37,14 @@ pub struct ScramAuthenticator<'a> {
     server_first: String,
     gs2_header: String,
     extracted_client_key: Option<Vec<u8>>,
+    choosed_mechanism: String,
+    /// `Some` means the frontend connection is TLS *and* the server certificate
+    /// has a defined `tls-server-end-point` hash, so `-PLUS` may be offered.
+    cert_hash: Option<CertHash>,
 }
 
 impl<'a> ScramAuthenticator<'a> {
-    pub fn new(verifier: &'a Verifier) -> Self {
+    pub fn new(verifier: &'a Verifier, cert_hash: Option<CertHash>) -> Self {
         ScramAuthenticator {
             verifier,
             state: State::Started,
@@ -48,11 +54,18 @@ impl<'a> ScramAuthenticator<'a> {
             server_first: String::new(),
             gs2_header: String::new(),
             extracted_client_key: None,
+            choosed_mechanism: String::new(),
+            cert_hash,
         }
     }
 
     pub fn mechanisms(&self) -> Vec<&'static str> {
-        vec![SCRAM_SHA_256]
+        if self.cert_hash.is_some() {
+            // `-PLUS` first: libpq selects the first mechanism it supports.
+            vec![PLUS, SCRAM_SHA_256]
+        } else {
+            vec![SCRAM_SHA_256]
+        }
     }
 
     pub fn handle_client_first(
@@ -65,7 +78,7 @@ impl<'a> ScramAuthenticator<'a> {
 
         let (flag, authzid_part, bare) = self.extract_data_from_client_first(client_first)?;
 
-        self.validate_gs2_flag(flag)?;
+        self.validate_gs2_flag(mechanism, flag)?;
         self.validate_authzid_part(authzid_part)?;
 
         self.gs2_header = format!("{flag},{authzid_part},");
@@ -99,6 +112,7 @@ impl<'a> ScramAuthenticator<'a> {
 
         self.server_first = server_first.clone();
         self.state = State::ClientFirstReceived;
+        self.choosed_mechanism = mechanism.to_owned();
         Ok(server_first)
     }
 
@@ -142,7 +156,7 @@ impl<'a> ScramAuthenticator<'a> {
         let nonce = nonce.ok_or_else(malformed)?;
         let proof_b64 = proof_b64.ok_or_else(malformed)?;
 
-        let expected_cbind = B64.encode(self.gs2_header.as_bytes());
+        let expected_cbind = self.expected_cbind();
 
         if cbind
             .as_bytes()
@@ -150,7 +164,7 @@ impl<'a> ScramAuthenticator<'a> {
             .unwrap_u8()
             != 1
         {
-            return Err(malformed());
+            return Err(self.channel_binding_error());
         }
 
         if nonce != self.combined_nonce {
@@ -193,7 +207,7 @@ impl<'a> ScramAuthenticator<'a> {
             != 1
         {
             return Err(ScramError::AuthenticationFailed(format!(
-                "password authentication failed for user {}",
+                "password authentication failed for user \"{}\"",
                 user
             )));
         }
@@ -204,7 +218,7 @@ impl<'a> ScramAuthenticator<'a> {
         // auth failed
         if self.verifier.dummy {
             return Err(ScramError::AuthenticationFailed(format!(
-                "password authentication failed for user {}",
+                "password authentication failed for user \"{}\"",
                 user
             )));
         }
@@ -242,7 +256,7 @@ impl<'a> ScramAuthenticator<'a> {
             ));
         }
 
-        if mechanism != SCRAM_SHA_256 {
+        if !self.mechanisms().contains(&mechanism) {
             return Err(ScramError::Protocol(format!(
                 "unsupported SASL mechanism: {}",
                 mechanism
@@ -263,26 +277,91 @@ impl<'a> ScramAuthenticator<'a> {
 
         Ok((parts[0], parts[1], parts[2]))
     }
-    fn validate_gs2_flag(&self, flag: &str) -> Result<(), ScramError> {
+    fn validate_gs2_flag(&self, mechanism: &str, flag: &str) -> Result<(), ScramError> {
+        match mechanism {
+            SCRAM_SHA_256 => self.validate_gs2_flag_for_scram(flag),
+            PLUS => self.validate_gs2_flag_for_plus(flag),
+            _ => Err(malformed()),
+        }
+    }
+
+    /// GS2 flag rules for a client that selected `SCRAM-SHA-256`.
+    fn validate_gs2_flag_for_scram(&self, flag: &str) -> Result<(), ScramError> {
         match flag {
-            "n" | "y" => {}
-            _ if flag.starts_with("p=") => {
-                return Err(ScramError::Protocol(
-                    "client requested channel binding, but SCRAM-SHA-256 was not offered".into(),
-                ))
+            // No channel binding: always acceptable.
+            "n" => Ok(()),
+            // `y` asserts "I support channel binding but believe the server does
+            // not". That is true only when we did not offer `-PLUS`; if we did,
+            // accepting it would let an attacker strip channel binding.
+            "y" => {
+                if self.cert_hash.is_some() {
+                    Err(ScramError::ChannelBindingDowngrade)
+                } else {
+                    Ok(())
+                }
             }
+            // Binding data without a `-PLUS` offer is a protocol violation.
+            _ if flag.starts_with("p=") => Err(ScramError::Protocol(
+                "client requested channel binding, but SCRAM-SHA-256-PLUS was not offered"
+                    .to_string(),
+            )),
+            _ => Err(malformed()),
+        }
+    }
 
-            _ => return Err(malformed()),
-        };
+    /// GS2 flag rules for a client that selected `SCRAM-SHA-256-PLUS`.
+    fn validate_gs2_flag_for_plus(&self, flag: &str) -> Result<(), ScramError> {
+        if flag == "p=tls-server-end-point" {
+            return Ok(());
+        }
 
-        Ok(())
+        // `n`/`y` carry no binding data, so a selected `-PLUS` cannot be bound.
+        if flag == "n" || flag == "y" {
+            return Err(ScramError::Protocol(
+                "SCRAM-SHA-256-PLUS selected without channel binding data".to_string(),
+            ));
+        }
+
+        // A different `p=<type>` is a channel binding we do not implement.
+        if flag.starts_with("p=") {
+            return Err(ScramError::Protocol(
+                "unsupported channel binding type".to_string(),
+            ));
+        }
+
+        Err(malformed())
+    }
+
+    /// The `c=` value the client must have sent for this exchange.
+    fn expected_cbind(&self) -> String {
+        if self.choosed_mechanism == PLUS {
+            if let Some(cert_hash) = &self.cert_hash {
+                return cert_hash.expected_c();
+            }
+        }
+
+        // `n,,` / `y,,`: the binding input is the GS2 header alone.
+        B64.encode(self.gs2_header.as_bytes())
+    }
+
+    /// A mismatched `c=` means something different depending on the mechanism:
+    /// on `-PLUS` the client bound to a different certificate (an authentication
+    /// failure); on plain SCRAM it is just a malformed message.
+    fn channel_binding_error(&self) -> ScramError {
+        if self.choosed_mechanism == PLUS {
+            ScramError::ChannelBindingMismatch
+        } else {
+            malformed()
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proxy::auth::error::AuthError;
     use crate::proxy::auth::verifier::{hmac_sha256, pbkdf2_sha256, sha256, Verifier};
+    use crate::proxy::tls::{CertHash, HashAlgorithm};
     use base64::{engine::general_purpose::STANDARD as B64, Engine};
 
     const USER: &str = "user";
@@ -292,6 +371,15 @@ mod tests {
     /// message is reconstructable in assertions.
     fn verifier() -> Verifier {
         Verifier::from_password("pencil", vec![0u8; 16], 4096)
+    }
+
+    /// A certificate hash with predictable digest bytes; only byte-exact
+    /// comparison matters, so any fixed pattern works.
+    fn cert_hash(digest: u8) -> CertHash {
+        CertHash {
+            algorithm: HashAlgorithm::Sha256,
+            digest: vec![digest; 32],
+        }
     }
 
     /// Unwrap a successful result, formatting the error via `Display`
@@ -313,8 +401,10 @@ mod tests {
     fn protocol_err(result: Result<String, ScramError>) -> String {
         match result {
             Err(ScramError::Protocol(message)) => message,
-            Err(ScramError::AuthenticationFailed(_)) => {
-                panic!("expected Protocol error, got AuthenticationFailed")
+            Err(ScramError::AuthenticationFailed(_))
+            | Err(ScramError::ChannelBindingMismatch)
+            | Err(ScramError::ChannelBindingDowngrade) => {
+                panic!("expected Protocol error, got a non-protocol error")
             }
             Ok(_) => panic!("expected error, got Ok"),
         }
@@ -362,7 +452,7 @@ mod tests {
         password: &str,
         client_first_bare: &str,
         server_first: &str,
-        gs2_header: &str,
+        cbind_input: &[u8],
     ) -> (String, String) {
         let mut combined = "";
         let mut salt_b64 = "";
@@ -377,7 +467,7 @@ mod tests {
             }
         }
 
-        let cbind = B64.encode(gs2_header.as_bytes());
+        let cbind = B64.encode(cbind_input);
         let client_final_no_proof = format!("c={cbind},r={combined}");
         let auth_message = format!("{client_first_bare},{server_first},{client_final_no_proof}");
 
@@ -421,7 +511,7 @@ mod tests {
         let client_first_bare = format!("n={USER},r={client_nonce}");
 
         let (client_final, expected_server_final) =
-            simulate_client(password, &client_first_bare, &server_first, gs2_header);
+            simulate_client(password, &client_first_bare, &server_first, gs2_header.as_bytes());
         let server_final = expect_ok(auth.handle_client_final(&client_final, ""));
         (server_final, expected_server_final)
     }
@@ -429,7 +519,7 @@ mod tests {
     #[test]
     fn mechanisms_offers_sha_256() {
         let v = verifier();
-        let auth = ScramAuthenticator::new(&v);
+        let auth = ScramAuthenticator::new(&v, None);
         assert_eq!(auth.mechanisms(), vec![SCRAM_SHA_256]);
     }
 
@@ -500,7 +590,7 @@ mod tests {
     #[test]
     fn ok_returns_structured_server_first() {
         let v = verifier();
-        let mut auth = ScramAuthenticator::new(&v);
+        let mut auth = ScramAuthenticator::new(&v, None);
         let client_first = format!("n,,n={USER},r={CLIENT_NONCE}");
 
         let server_first = expect_ok(auth.handle_client_first(SCRAM_SHA_256, &client_first, USER));
@@ -535,7 +625,7 @@ mod tests {
     fn ok_accepts_n_and_y_gs2_flags() {
         for flag in ["n", "y"] {
             let v = verifier();
-            let mut auth = ScramAuthenticator::new(&v);
+            let mut auth = ScramAuthenticator::new(&v, None);
             let client_first = format!("{flag},,n={USER},r={CLIENT_NONCE}");
             let server_first = auth
                 .handle_client_first(SCRAM_SHA_256, &client_first, USER)
@@ -547,7 +637,7 @@ mod tests {
     #[test]
     fn ok_state_advances_and_rejects_replay() {
         let v = verifier();
-        let mut auth = ScramAuthenticator::new(&v);
+        let mut auth = ScramAuthenticator::new(&v, None);
         let client_first = format!("n,,n={USER},r={CLIENT_NONCE}");
 
         expect_ok(auth.handle_client_first(SCRAM_SHA_256, &client_first, USER));
@@ -560,7 +650,7 @@ mod tests {
     #[test]
     fn ok_can_retry_after_protocol_error() {
         let v = verifier();
-        let mut auth = ScramAuthenticator::new(&v);
+        let mut auth = ScramAuthenticator::new(&v, None);
 
         // Parsing failure leaves state untouched (still Started), so a retry works.
         assert_malformed(auth.handle_client_first(SCRAM_SHA_256, "n,", USER));
@@ -576,7 +666,7 @@ mod tests {
     #[test]
     fn err_missing_client_nonce() {
         let v = verifier();
-        let mut auth = ScramAuthenticator::new(&v);
+        let mut auth = ScramAuthenticator::new(&v, None);
         // Valid gs2 header, but the bare part carries no r= attribute.
         let client_first = format!("n,,n={USER}");
         assert_malformed(auth.handle_client_first(SCRAM_SHA_256, &client_first, USER));
@@ -585,14 +675,14 @@ mod tests {
     #[test]
     fn err_fewer_than_three_comma_parts() {
         let v = verifier();
-        let mut auth = ScramAuthenticator::new(&v);
+        let mut auth = ScramAuthenticator::new(&v, None);
         assert_malformed(auth.handle_client_first(SCRAM_SHA_256, "n,", USER));
     }
 
     #[test]
     fn err_empty_startup_user() {
         let v = verifier();
-        let mut auth = ScramAuthenticator::new(&v);
+        let mut auth = ScramAuthenticator::new(&v, None);
         let client_first = format!("n,,n={USER},r={CLIENT_NONCE}");
         let err = protocol_err(auth.handle_client_first(SCRAM_SHA_256, &client_first, ""));
         assert_eq!(err, "startup user must not be empty");
@@ -601,7 +691,7 @@ mod tests {
     #[test]
     fn err_unsupported_mechanism() {
         let v = verifier();
-        let mut auth = ScramAuthenticator::new(&v);
+        let mut auth = ScramAuthenticator::new(&v, None);
         let client_first = format!("n,,n={USER},r={CLIENT_NONCE}");
         let err = protocol_err(auth.handle_client_first("SCRAM-SHA-256-PLUS", &client_first, USER));
         assert_eq!(err, "unsupported SASL mechanism: SCRAM-SHA-256-PLUS");
@@ -610,19 +700,19 @@ mod tests {
     #[test]
     fn err_channel_binding_not_offered() {
         let v = verifier();
-        let mut auth = ScramAuthenticator::new(&v);
+        let mut auth = ScramAuthenticator::new(&v, None);
         let client_first = format!("p=tls-unique,,n={USER},r={CLIENT_NONCE}");
         let err = protocol_err(auth.handle_client_first(SCRAM_SHA_256, &client_first, USER));
         assert_eq!(
             err,
-            "client requested channel binding, but SCRAM-SHA-256 was not offered"
+            "client requested channel binding, but SCRAM-SHA-256-PLUS was not offered"
         );
     }
 
     #[test]
     fn err_invalid_gs2_flag() {
         let v = verifier();
-        let mut auth = ScramAuthenticator::new(&v);
+        let mut auth = ScramAuthenticator::new(&v, None);
         let client_first = format!("x,,n={USER},r={CLIENT_NONCE}");
         assert_malformed(auth.handle_client_first(SCRAM_SHA_256, &client_first, USER));
     }
@@ -630,7 +720,7 @@ mod tests {
     #[test]
     fn err_authzid_not_supported() {
         let v = verifier();
-        let mut auth = ScramAuthenticator::new(&v);
+        let mut auth = ScramAuthenticator::new(&v, None);
         // Non-empty authorization identity is rejected.
         let client_first = format!("n,a={USER},n={USER},r={CLIENT_NONCE}");
         let err = protocol_err(auth.handle_client_first(SCRAM_SHA_256, &client_first, USER));
@@ -640,7 +730,7 @@ mod tests {
     #[test]
     fn err_malformed_authzid() {
         let v = verifier();
-        let mut auth = ScramAuthenticator::new(&v);
+        let mut auth = ScramAuthenticator::new(&v, None);
         // Anything between the gs2 commas that isn't empty and doesn't start with "a=".
         let client_first = format!("n,zz,n={USER},r={CLIENT_NONCE}");
         assert_malformed(auth.handle_client_first(SCRAM_SHA_256, &client_first, USER));
@@ -649,7 +739,7 @@ mod tests {
     #[test]
     fn extractor_splits_gs2_header_from_bare() {
         let v = verifier();
-        let auth = ScramAuthenticator::new(&v);
+        let auth = ScramAuthenticator::new(&v, None);
         let client_first = format!("n,,n={USER},r={CLIENT_NONCE}");
         let (flag, authzid, bare) = expect_ok(auth.extract_data_from_client_first(&client_first));
         assert_eq!(flag, "n");
@@ -663,7 +753,7 @@ mod tests {
     #[test]
     fn ok_full_exchange_returns_verifiable_server_signature() {
         let v = verifier();
-        let mut auth = ScramAuthenticator::new(&v);
+        let mut auth = ScramAuthenticator::new(&v, None);
 
         let (server_final, expected) =
             full_client_exchange(&mut auth, "pencil", "n,,", CLIENT_NONCE);
@@ -681,7 +771,7 @@ mod tests {
     #[test]
     fn ok_full_exchange_accepts_y_gs2_flag() {
         let v = verifier();
-        let mut auth = ScramAuthenticator::new(&v);
+        let mut auth = ScramAuthenticator::new(&v, None);
 
         let (server_final, expected) =
             full_client_exchange(&mut auth, "pencil", "y,,", CLIENT_NONCE);
@@ -691,7 +781,7 @@ mod tests {
     #[test]
     fn ok_state_is_done_after_successful_exchange() {
         let v = verifier();
-        let mut auth = ScramAuthenticator::new(&v);
+        let mut auth = ScramAuthenticator::new(&v, None);
         let (_, _) = full_client_exchange(&mut auth, "pencil", "n,,", CLIENT_NONCE);
 
         assert_malformed(auth.handle_client_final("c=biws,r=x,p=AAAA", ""));
@@ -700,11 +790,11 @@ mod tests {
     #[test]
     fn err_wrong_password_fails_authentication() {
         let v = verifier();
-        let mut auth = ScramAuthenticator::new(&v);
+        let mut auth = ScramAuthenticator::new(&v, None);
         let server_first = begin_exchange(&mut auth);
 
         let bare = format!("n={USER},r={CLIENT_NONCE}");
-        let (client_final, _) = simulate_client("not-pencil", &bare, &server_first, "n,,");
+        let (client_final, _) = simulate_client("not-pencil", &bare, &server_first, b"n,,");
 
         assert!(
             matches!(
@@ -718,7 +808,7 @@ mod tests {
     #[test]
     fn err_proof_attribute_is_not_last() {
         let v = verifier();
-        let mut auth = ScramAuthenticator::new(&v);
+        let mut auth = ScramAuthenticator::new(&v, None);
         let server_first = begin_exchange(&mut auth);
         let nonce = combined_nonce_of(&server_first);
 
@@ -731,7 +821,7 @@ mod tests {
     #[test]
     fn err_client_final_out_of_order() {
         let v = verifier();
-        let mut auth = ScramAuthenticator::new(&v);
+        let mut auth = ScramAuthenticator::new(&v, None);
         // handle_client_final before any client-first.
         assert_malformed(auth.handle_client_final("c=biws,r=x,p=AAAA", ""));
     }
@@ -746,7 +836,7 @@ mod tests {
         // here only need to be syntactically parseable.
         let cases = ["r=x,p=AAAA", "c=biws,p=AAAA", "c=biws,r=x"];
         for message in cases {
-            let mut auth = ScramAuthenticator::new(&v);
+            let mut auth = ScramAuthenticator::new(&v, None);
             begin_exchange(&mut auth);
             assert_malformed(auth.handle_client_final(message, ""));
         }
@@ -763,7 +853,7 @@ mod tests {
             "c=biws,r=x,p=AAAA,p=BBBB",
         ];
         for message in cases {
-            let mut auth = ScramAuthenticator::new(&v);
+            let mut auth = ScramAuthenticator::new(&v, None);
             begin_exchange(&mut auth);
             assert_malformed(auth.handle_client_final(message, ""));
         }
@@ -772,7 +862,7 @@ mod tests {
     #[test]
     fn err_channel_binding_mismatch() {
         let v = verifier();
-        let mut auth = ScramAuthenticator::new(&v);
+        let mut auth = ScramAuthenticator::new(&v, None);
         begin_exchange(&mut auth); // server echoed GS2 header "n,,"
 
         // cbind is base64 of "y,," ("eSws") instead of the echoed "n,," ("biws").
@@ -783,7 +873,7 @@ mod tests {
     #[test]
     fn err_nonce_mismatch() {
         let v = verifier();
-        let mut auth = ScramAuthenticator::new(&v);
+        let mut auth = ScramAuthenticator::new(&v, None);
         let server_first = begin_exchange(&mut auth);
         let combined = combined_nonce_of(&server_first);
 
@@ -792,7 +882,7 @@ mod tests {
         assert_malformed(auth.handle_client_final(&truncated, ""));
 
         // A completely different nonce.
-        let mut auth = ScramAuthenticator::new(&v);
+        let mut auth = ScramAuthenticator::new(&v, None);
         begin_exchange(&mut auth);
         assert_malformed(auth.handle_client_final("c=biws,r=totally-different,p=AAAA", ""));
     }
@@ -807,11 +897,143 @@ mod tests {
 
         for payload in cases {
             let v = verifier();
-            let mut auth = ScramAuthenticator::new(&v);
+            let mut auth = ScramAuthenticator::new(&v, None);
             let server_first = begin_exchange(&mut auth);
             let nonce = combined_nonce_of(&server_first);
             let message = format!("c=biws,r={nonce},p={payload}");
             assert_malformed(auth.handle_client_final(&message, ""));
         }
+    }
+
+    // ---- SCRAM-SHA-256-PLUS / channel binding ----
+
+    #[test]
+    fn mechanisms_offers_plus_first_only_with_a_certificate_hash() {
+        let v = verifier();
+
+        assert_eq!(
+            ScramAuthenticator::new(&v, None).mechanisms(),
+            vec![SCRAM_SHA_256],
+            "no certificate hash means no -PLUS"
+        );
+        assert_eq!(
+            ScramAuthenticator::new(&v, Some(cert_hash(7))).mechanisms(),
+            vec![PLUS, SCRAM_SHA_256],
+            "-PLUS must come first so libpq selects it"
+        );
+    }
+
+    #[test]
+    fn ok_plus_exchange_verifies_binding_and_proof() {
+        let v = verifier();
+        let hash = cert_hash(7);
+        let mut auth = ScramAuthenticator::new(&v, Some(hash.clone()));
+
+        let client_first = format!("p=tls-server-end-point,,n={USER},r={CLIENT_NONCE}");
+        let server_first = expect_ok(auth.handle_client_first(PLUS, &client_first, USER));
+
+        let bare = format!("n={USER},r={CLIENT_NONCE}");
+        let (client_final, expected_server_final) =
+            simulate_client("pencil", &bare, &server_first, &hash.cbind_input());
+
+        let server_final = expect_ok(auth.handle_client_final(&client_final, USER));
+        assert_eq!(server_final, expected_server_final);
+        assert!(auth.extracted_client_key().is_some());
+    }
+
+    #[test]
+    fn err_plus_wrong_certificate_is_a_binding_mismatch() {
+        let v = verifier();
+        // The client bound to a different certificate than the server holds —
+        // exactly what a TLS-terminating man-in-the-middle would cause.
+        let server_hash = cert_hash(1);
+        let attacker_hash = cert_hash(2);
+        let mut auth = ScramAuthenticator::new(&v, Some(server_hash));
+
+        let client_first = format!("p=tls-server-end-point,,n={USER},r={CLIENT_NONCE}");
+        let server_first = expect_ok(auth.handle_client_first(PLUS, &client_first, USER));
+
+        let bare = format!("n={USER},r={CLIENT_NONCE}");
+        let (client_final, _) =
+            simulate_client("pencil", &bare, &server_first, &attacker_hash.cbind_input());
+
+        assert!(matches!(
+            auth.handle_client_final(&client_final, USER),
+            Err(ScramError::ChannelBindingMismatch)
+        ));
+    }
+
+    #[test]
+    fn err_y_is_a_downgrade_when_plus_was_offered() {
+        let v = verifier();
+        let mut auth = ScramAuthenticator::new(&v, Some(cert_hash(7)));
+
+        let client_first = format!("y,,n={USER},r={CLIENT_NONCE}");
+        assert!(matches!(
+            auth.handle_client_first(SCRAM_SHA_256, &client_first, USER),
+            Err(ScramError::ChannelBindingDowngrade)
+        ));
+    }
+
+    #[test]
+    fn ok_y_is_accepted_when_plus_was_not_offered() {
+        let v = verifier();
+        let mut auth = ScramAuthenticator::new(&v, None);
+
+        let client_first = format!("y,,n={USER},r={CLIENT_NONCE}");
+        assert!(
+            auth.handle_client_first(SCRAM_SHA_256, &client_first, USER)
+                .is_ok(),
+            "without an offer the client's `y` is truthful and must be accepted"
+        );
+    }
+
+    #[test]
+    fn err_p_binding_when_plus_was_not_offered() {
+        let v = verifier();
+        let mut auth = ScramAuthenticator::new(&v, None);
+
+        let client_first = format!("p=tls-server-end-point,,n={USER},r={CLIENT_NONCE}");
+        assert!(matches!(
+            auth.handle_client_first(SCRAM_SHA_256, &client_first, USER),
+            Err(ScramError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn err_plus_selected_without_binding_data() {
+        let v = verifier();
+
+        for flag in ["n,,", "y,,"] {
+            let mut auth = ScramAuthenticator::new(&v, Some(cert_hash(7)));
+            let client_first = format!("{flag}n={USER},r={CLIENT_NONCE}");
+            assert!(
+                matches!(
+                    auth.handle_client_first(PLUS, &client_first, USER),
+                    Err(ScramError::Protocol(_))
+                ),
+                "flag {flag:?} selects -PLUS without binding data"
+            );
+        }
+    }
+
+    #[test]
+    fn err_plus_with_a_different_binding_type() {
+        let v = verifier();
+        let mut auth = ScramAuthenticator::new(&v, Some(cert_hash(7)));
+
+        let client_first = format!("p=tls-unique,,n={USER},r={CLIENT_NONCE}");
+        assert!(matches!(
+            auth.handle_client_first(PLUS, &client_first, USER),
+            Err(ScramError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn channel_binding_error_codes() {
+        // The SQLSTATE split is the contract: a binding mismatch is an
+        // authentication failure, a downgrade is a protocol violation.
+        assert_eq!(ScramError::ChannelBindingMismatch.code(), "28P01");
+        assert_eq!(ScramError::ChannelBindingDowngrade.code(), "08P01");
     }
 }

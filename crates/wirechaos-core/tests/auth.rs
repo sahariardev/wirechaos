@@ -134,33 +134,53 @@ async fn wrong_password_is_reported_to_the_client() {
 #[tokio::test]
 async fn unknown_user_is_rejected() {
     let (addr, server) = spawn_auth_server(TestVerifierProvider::empty(), Some(USER)).await;
-    let _tcp = TcpStream::connect(addr).await.expect("connect");
+    let mut tcp = TcpStream::connect(addr).await.expect("connect");
 
-    let error = server
+    // The unknown user runs the full exchange against a mock verifier, then
+    // fails with the same 28P01 a wrong password produces.
+    let mut client = ScramClient::new(USER, PASSWORD, CLIENT_NONCE);
+    exchange_until_client_final(&mut tcp, &mut client).await;
+    write_message(&mut tcp, MSG_PASSWORD, client.client_final().as_bytes()).await;
+
+    let error = read_error(&mut tcp).await;
+    assert_eq!(
+        error.get(&'C').map(String::as_str),
+        Some("28P01"),
+        "an unknown user must be indistinguishable from a wrong password: {error:?}"
+    );
+
+    let outcome = server
         .await
         .expect("server task completed cleanly")
-        .expect_err("an unknown user must fail authentication");
+        .expect("a rejected authentication is not a connection-level error");
 
     assert!(
-        error.contains("unknown user"),
-        "the verifier provider's error must surface: {error}"
+        outcome.is_none(),
+        "no ClientKey may be handed to the caller after a failed authentication"
     );
 }
 
 #[tokio::test]
 async fn startup_without_user_is_rejected_instead_of_panicking() {
     let (addr, server) = spawn_auth_server(TestVerifierProvider::new(), None).await;
-    let _tcp = TcpStream::connect(addr).await.expect("connect");
+    let mut tcp = TcpStream::connect(addr).await.expect("connect");
 
-    let error = server
+    let error = read_error(&mut tcp).await;
+    assert!(
+        error
+            .get(&'M')
+            .expect("ErrorResponse must carry a message field")
+            .to_lowercase()
+            .contains("user"),
+        "the missing user must be named in the error: {error:?}"
+    );
+
+    let outcome = server
         .await
         .expect("server task completed cleanly")
-        .expect_err("authentication without a startup user must fail");
+        .expect("authentication without a startup user is a rejection, not a fault");
 
-    assert!(
-        error.to_lowercase().contains("user"),
-        "the missing user must be named in the error: {error}"
-    );
+    assert!(outcome.is_none());
 }
 
 #[tokio::test]
@@ -175,15 +195,22 @@ async fn non_sasl_message_is_rejected() {
     assert_eq!(auth_sub_code(&body), AUTH_SASL);
     write_message(&mut tcp, b'Q', b"select 1\0").await;
 
-    let error = server
+    let error = read_error(&mut tcp).await;
+    assert!(
+        error
+            .get(&'M')
+            .expect("ErrorResponse must carry a message field")
+            .to_lowercase()
+            .contains("invalid message"),
+        "unexpected error fields: {error:?}"
+    );
+
+    let outcome = server
         .await
         .expect("server task completed cleanly")
-        .expect_err("a non-SASL response must be rejected");
+        .expect("a non-SASL response is a rejection, not a connection-level error");
 
-    assert!(
-        error.contains("Invalid message"),
-        "unexpected error: {error}"
-    );
+    assert!(outcome.is_none());
 }
 
 #[tokio::test]
@@ -199,15 +226,22 @@ async fn unsupported_mechanism_is_rejected() {
     let body = sasl_initial_response_body("SCRAM-SHA-256-PLUS", b"p=tls-unique,,n=peter,r=abc");
     write_message(&mut tcp, MSG_PASSWORD, &body).await;
 
-    let error = server
+    let error = read_error(&mut tcp).await;
+    assert!(
+        error
+            .get(&'M')
+            .expect("ErrorResponse must carry a message field")
+            .to_lowercase()
+            .contains("invalid mechanism"),
+        "unexpected error fields: {error:?}"
+    );
+
+    let outcome = server
         .await
         .expect("server task completed cleanly")
-        .expect_err("an unoffered mechanism must be rejected");
+        .expect("an unoffered mechanism is a rejection, not a connection-level error");
 
-    assert!(
-        error.contains("invalid mechanism"),
-        "unexpected error: {error}"
-    );
+    assert!(outcome.is_none());
 }
 
 #[tokio::test]

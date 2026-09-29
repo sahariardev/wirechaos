@@ -1,4 +1,3 @@
-use crate::proxy::ProxyError;
 use crate::proxy::auth::verifier::VerifierProvider;
 use crate::proxy::buffer_pool::{MultiBufferPool, PooledBytes};
 use crate::proxy::conn_read::ConnRead;
@@ -6,12 +5,13 @@ use crate::proxy::conn_write::ConnWrite;
 use crate::proxy::packet::MessageReader;
 use crate::proxy::replication_mode::ReplicationMode;
 use crate::proxy::startup_config_parse_util::{parse_options, parse_replication_mode};
+use crate::proxy::tls::FrontendTls;
+use crate::proxy::ProxyError;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpStream;
-use tokio_rustls::TlsAcceptor;
 
 pub struct Conn<V: VerifierProvider> {
     pub buffer_reader: BufReader<ConnRead>,
@@ -21,7 +21,7 @@ pub struct Conn<V: VerifierProvider> {
     pub ssl_done: bool,
     pub required_tls: bool,
     pub gss_done: bool,
-    pub tls_acceptor: Option<TlsAcceptor>,
+    pub frontend_tls: Option<FrontendTls>,
     pub protocol_version: Option<u32>,
     pub params: HashMap<String, String>,
     pub user: Option<String>,
@@ -44,7 +44,7 @@ impl<V: VerifierProvider> Conn<V> {
     pub fn new(
         stream: TcpStream,
         pool: Arc<MultiBufferPool>,
-        tls_acceptor: Option<TlsAcceptor>,
+        frontend_tls: Option<FrontendTls>,
         verifier_provider: V,
     ) -> Self {
         let (read_half, write_half) = stream.into_split();
@@ -56,7 +56,7 @@ impl<V: VerifierProvider> Conn<V> {
             gss_done: false,
             //todo:: pass this from parent config
             required_tls: false,
-            tls_acceptor,
+            frontend_tls,
             protocol_version: None,
             params: HashMap::new(),
             user: None,
@@ -198,7 +198,7 @@ impl<V: VerifierProvider> Conn<V> {
         }
         self.ssl_done = true;
 
-        if self.tls_acceptor.is_some() {
+        if self.frontend_tls.is_some() {
             // Offer TLS: the client expects 'S' and then runs the
             // handshake on this socket.
             self.buffer_writer.write_all(b"S").await?;
@@ -236,9 +236,9 @@ impl<V: VerifierProvider> Conn<V> {
         };
 
         let tcp = read_half.reunite(write_half)?;
-        let acceptor = self.tls_acceptor.as_ref().ok_or("TLS acceptor not set")?;
+        let tls_acceptor = self.frontend_tls.as_ref().ok_or("TLS acceptor not set")?;
 
-        let tls = acceptor.accept(tcp).await?;
+        let tls = tls_acceptor.acceptor.accept(tcp).await?;
 
         let (read_half, write_half) = tokio::io::split(tls);
         self.buffer_reader = BufReader::new(ConnRead::Tls(read_half));
@@ -316,11 +316,7 @@ impl<V: VerifierProvider> Conn<V> {
         Ok(())
     }
 
-    pub async fn write_message(
-        &mut self,
-        message_type: u8,
-        body: &[u8],
-    ) -> Result<(), ProxyError> {
+    pub async fn write_message(&mut self, message_type: u8, body: &[u8]) -> Result<(), ProxyError> {
         let len = (body.len() + 4) as u32;
         self.buffer_writer.write_all(&[message_type]).await?;
         self.buffer_writer.write_all(&len.to_be_bytes()).await?;

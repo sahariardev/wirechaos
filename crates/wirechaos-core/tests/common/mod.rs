@@ -24,6 +24,7 @@ use wirechaos_core::proxy::auth::verifier::{
     hmac_sha256, pbkdf2_sha256, sha256, ProviderError, Verifier, VerifierProvider,
 };
 use wirechaos_core::proxy::buffer_pool::MultiBufferPool;
+use wirechaos_core::proxy::tls::FrontendTls;
 
 /// (1234 << 16) | 5679 — the SSLRequest startup-message code.
 pub const SSL_REQUEST_CODE: u32 = 80877103;
@@ -61,9 +62,9 @@ pub fn buffer_pool() -> Arc<MultiBufferPool> {
     MultiBufferPool::new(4, 1024, 4)
 }
 
-/// Generate a fresh self-signed certificate and build a matching server
-/// acceptor and client connector from it.
-pub fn tls_pair() -> (TlsAcceptor, TlsConnector) {
+/// Generate a fresh self-signed certificate and build a matching frontend TLS
+/// bundle and client connector from it.
+pub fn tls_pair() -> (FrontendTls, TlsConnector) {
     let certified_key = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
         .expect("generate self-signed certificate");
     let cert_der = certified_key.cert.der().clone();
@@ -92,7 +93,14 @@ pub fn tls_pair() -> (TlsAcceptor, TlsConnector) {
 
     let connector = TlsConnector::from(Arc::new(client_config));
 
-    (acceptor, connector)
+    // These startup tests exercise the transport, not channel binding, so the
+    // hash is left undefined and only SCRAM-SHA-256 is advertised.
+    let frontend_tls = FrontendTls {
+        acceptor,
+        cert_hash: None,
+    };
+
+    (frontend_tls, connector)
 }
 
 /// The name the client uses to verify the test server's certificate.
@@ -149,6 +157,14 @@ impl VerifierProvider for TestVerifierProvider {
     /// so a store failure cannot be simulated from here yet.
     fn lookup(&self, username: &str) -> Result<Option<Verifier>, ProviderError> {
         Ok(self.users.get(username).cloned())
+    }
+
+    /// The mock verifier used for users that do not exist: deterministic, and
+    /// marked `dummy` so `handle_client_final` always fails the proof check.
+    fn get_dummy_verifier(&self) -> Result<Verifier, ProviderError> {
+        let mut dummy = verifier("wirechaos-dummy-password");
+        dummy.dummy = true;
+        Ok(dummy)
     }
 }
 

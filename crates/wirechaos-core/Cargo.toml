@@ -28,6 +28,11 @@ subtle = "2.5"
 rustls-pemfile.workspace = true
 x509-parser.workspace = true
 oid-registry.workspace = true
+zeroize = { version = "1.8", features = ["derive"] }
+arc-swap = "1.7"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "net", "io-util"] }
 rcgen = "0.13"
+static_assertions = "1.1"
+tokio-postgres = { version = "0.7", optional = true }

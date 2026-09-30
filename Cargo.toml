@@ -27,6 +27,7 @@ rustls = "0.21"
 rustls-pemfile = "2.0"
 x509-parser = "0.18"
 oid-registry = "0.8"
+rpassword = "7"
 
 # Lint policy. Members opt in with `[lints] workspace = true`.
 #

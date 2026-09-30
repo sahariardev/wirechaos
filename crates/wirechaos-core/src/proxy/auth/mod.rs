@@ -3,3 +3,4 @@ pub mod scram;
 pub mod verifier;
 
 pub mod handler;
+mod credentials;

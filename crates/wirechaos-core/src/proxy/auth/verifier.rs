@@ -3,6 +3,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::error::Error;
+use std::sync::Arc;
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -43,9 +44,10 @@ pub enum SecretFormatError {
     SaltTooShort,
 }
 
-pub trait VerifierProvider {
-    fn lookup(&self, username: &str) -> Result<Option<Verifier>, ProviderError>;
-    fn get_dummy_verifier(&self) -> Result<Verifier, ProviderError>;
+pub trait VerifierProvider: Send + Sync + 'static {
+    async fn lookup(&self, username: &str) -> Result<Option<Arc<Verifier>>, ProviderError>;
+
+    fn get_dummy_verifier(&self, username: &str) -> Verifier;
 }
 
 #[derive(Zeroize, ZeroizeOnDrop)]

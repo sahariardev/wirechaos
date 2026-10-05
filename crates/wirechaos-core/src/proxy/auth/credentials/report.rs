@@ -47,7 +47,7 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-#[derive(Debug)]
+#[derive(Default)]
 pub(crate) struct ErrorBag {
     entries: Vec<EntryError>,
 }

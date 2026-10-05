@@ -5,6 +5,7 @@ use crate::proxy::auth::verifier::VerifierProvider;
 use crate::proxy::buffer_pool::PooledBytes;
 use crate::proxy::conn::Conn;
 use crate::proxy::packet::MessageReader;
+use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tracing::warn;
 
@@ -26,17 +27,9 @@ impl<V: VerifierProvider> Conn<V> {
                 ))
             })?;
 
-        let verifier = match self.provider.lookup(&user) {
+        let verifier = match self.provider.lookup(&user).await {
             Ok(Some(verifier)) => verifier,
-            Ok(None) => {
-                //if user does not exist, then continue to scram auth with dummy verifier
-                match self.provider.get_dummy_verifier() {
-                    Ok(verifier) => verifier,
-                    Err(e) => {
-                        return Err(AuthFailure::rejected(e));
-                    }
-                }
-            }
+            Ok(None) => Arc::new(self.provider.get_dummy_verifier(&user)),
             Err(e) => {
                 // A credential-store fault, not a client mistake — it gets its
                 // own line so a store outage is not lost among failed logins.
@@ -56,7 +49,7 @@ impl<V: VerifierProvider> Conn<V> {
             None
         };
 
-        let mut scram = ScramAuthenticator::new(&verifier, cert_hash);
+        let mut scram = ScramAuthenticator::new(verifier.as_ref(), cert_hash);
         let mechanics = scram.mechanisms();
 
         self.send_auth_sasl(&mechanics)

@@ -15,3 +15,9 @@ clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
+rpassword.workspace = true
+zeroize = "1.8"
+
+[features]
+# Forward the optional live-catalog credential source to the core crate.
+auth-query = ["wirechaos-core/auth-query"]

@@ -131,8 +131,8 @@ mod tests {
     /// tied to `algorithm`, and return its DER.
     fn generated_cert(algorithm: &'static rcgen::SignatureAlgorithm) -> Vec<u8> {
         let key_pair = rcgen::KeyPair::generate_for(algorithm).expect("generate key pair");
-        let params =
-            rcgen::CertificateParams::new(vec!["localhost".to_owned()]).expect("certificate params");
+        let params = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
+            .expect("certificate params");
         let certificate = params
             .self_signed(&key_pair)
             .expect("sign self-signed certificate");

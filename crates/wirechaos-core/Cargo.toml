@@ -30,10 +30,17 @@ x509-parser.workspace = true
 oid-registry.workspace = true
 zeroize = { version = "1.8", features = ["derive"] }
 arc-swap = "1.7"
-tokio-postgres.workspace = true
+tokio-postgres = { workspace = true, optional = true }
+stringprep = "0.1"
+
+[features]
+# The pgbouncer-style `auth_query` source pulls in a SQL driver. It is off by
+# default so the data plane's dependency tree (and audit surface) stays small;
+# enable it for a deployment that reads credentials from a live catalog.
+auth-query = ["dep:tokio-postgres"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "net", "io-util"] }
 rcgen = "0.13"
 static_assertions = "1.1"
-tokio-postgres = "0.7"
+tempfile = "3"

@@ -1,15 +1,22 @@
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
 use rand::RngCore;
 use serde::Deserialize;
-use std::collections::HashMap;
-use std::sync::Arc;
+use zeroize::Zeroizing;
 
 use crate::proxy::auth::{
     credentials::{
         report::{ConfigError, ErrorBag},
+        secret::derive_verifier,
         store::Snapshot,
     },
     verifier::{SecretFormatError, Verifier},
 };
+
+/// The plaintext YAML iteration count used when deriving a verifier from a
+/// `password:` entry. It matches PostgreSQL's `scram_sha_256_iterations`.
+pub const DEFAULT_ITERATIONS: u32 = 4096;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -25,70 +32,81 @@ pub(crate) struct RawStoreFile {
     users: Vec<RawUser>,
 }
 
+/// Parse and validate a `users:` YAML document into a snapshot.
+///
+/// The input is copied into a zeroizing buffer before parsing so the raw text
+/// does not outlive the load in freed memory.
 pub(crate) fn snapshot_from_yaml(text: &str) -> Result<Snapshot, ConfigError> {
-    let raw_store_file: RawStoreFile =
-        serde_yaml::from_str(text).map_err(|_| ConfigError::single("file", "invalid yaml"))?;
+    let buffer = Zeroizing::new(text.to_owned());
 
-    let mut error_bag = ErrorBag::default();
+    let raw_store_file: RawStoreFile = serde_yaml::from_str(&buffer)
+        .map_err(|_| ConfigError::single("file", "invalid YAML user list"))?;
+
+    let mut errors = ErrorBag::default();
     let mut users: HashMap<String, Arc<Verifier>> = HashMap::new();
+    let mut seen: HashSet<String> = HashSet::new();
 
     if raw_store_file.users.is_empty() {
-        error_bag.push(None, "users", "At least one user is required");
+        errors.push(None, "users", "at least one user is required");
     }
 
-    for user in raw_store_file.users {
-        match validate_user(&user, &mut users) {
-            Err((field, reason)) => {
-                error_bag.push(Some(&user.name), field, reason);
+    for mut user in raw_store_file.users {
+        // Take the secret-bearing strings into zeroizing buffers immediately, so
+        // the serde-allocated originals are overwritten when the iteration ends
+        // (and on an early `?`/return).
+        let password: Option<Zeroizing<String>> = user.password.take().map(Zeroizing::new);
+        let scram_secret: Option<Zeroizing<String>> = user.scram_secret.take().map(Zeroizing::new);
+
+        let mut name_ok = true;
+
+        if user.name.is_empty() {
+            errors.push(None, "name", "must not be empty");
+            name_ok = false;
+        }
+
+        if user.name.contains('\0') {
+            errors.push(Some(&user.name), "name", "must not contain NUL");
+            name_ok = false;
+        }
+
+        if !seen.insert(user.name.clone()) {
+            errors.push(Some(&user.name), "name", "duplicate user name");
+            name_ok = false;
+        }
+
+        match (password.as_ref(), scram_secret.as_ref()) {
+            (Some(password), None) => {
+                if password.is_empty() {
+                    errors.push(Some(&user.name), "password", "must not be empty");
+                } else if name_ok {
+                    let verifier = derive_verifier(password, &random_salt(), DEFAULT_ITERATIONS);
+                    users.insert(user.name.clone(), Arc::new(verifier));
+                }
             }
-            _ => {}
-        }
-    }
-
-    error_bag.into_result()?;
-    let snapshot = Snapshot::new(0, users);
-    Ok(snapshot)
-}
-
-fn validate_user(
-    user: &RawUser,
-    users: &mut HashMap<String, Arc<Verifier>>,
-) -> Result<(), (&'static str, &'static str)> {
-    if user.name.is_empty() {
-        return Err(("name", "must not be empty"));
-    }
-
-    if user.name.contains('\0') {
-        return Err(("name", "must not contain null"));
-    }
-
-    if users.contains_key(&user.name) {
-        return Err(("name", "duplicate user name"));
-    }
-
-    let verifier = match (&user.password, &user.scram_secret) {
-        (Some(password), None) => {
-            if password.is_empty() {
-                return Err(("password", "must not be empty"));
+            (None, Some(scram_secret)) => match Verifier::from_pg_secret(scram_secret) {
+                Ok(verifier) => {
+                    if name_ok {
+                        users.insert(user.name.clone(), Arc::new(verifier));
+                    }
+                }
+                Err(error) => {
+                    let (field, reason) = secret_reason(&error);
+                    errors.push(Some(&user.name), field, reason);
+                }
+            },
+            _ => {
+                errors.push(
+                    Some(&user.name),
+                    "password",
+                    "exactly one of `password` or `scram_secret` is required",
+                );
             }
-
-            Verifier::from_password(password.as_bytes(), &random_salt(), 4096)
         }
-        (None, Some(scram_secret)) => {
-            Verifier::from_pg_secret(&scram_secret).map_err(|error| secret_reason(&error))?
-        }
+    }
 
-        _ => {
-            return Err((
-                "password",
-                "exactly one of `password` or `scram_secret` is required",
-            ))
-        }
-    };
+    errors.into_result()?;
 
-    users.insert(user.name.clone(), Arc::new(verifier));
-
-    Ok(())
+    Ok(Snapshot::new(0, users))
 }
 
 fn secret_reason(err: &SecretFormatError) -> (&'static str, &'static str) {
@@ -96,13 +114,13 @@ fn secret_reason(err: &SecretFormatError) -> (&'static str, &'static str) {
     (
         "scram_secret",
         match err {
-            Md5 => "MD5 secret are not supported (rehash with scram-sha-256)",
-            UnsupportedScheme => "expected scram-sha-256",
+            Md5 => "MD5 secrets are not supported; re-hash the role with scram-sha-256",
+            UnsupportedScheme => "expected a SCRAM-SHA-256 secret",
             Syntax => "malformed secret",
             Iterations => "invalid iteration count",
-            IterationsTooLow => "iteration must be atleast 4096",
+            IterationsTooLow => "iteration count must be at least 4096",
             Base64 { .. } => "invalid base64",
-            KeyLength { .. } => "key must be 32 bytes",
+            KeyLength { .. } => "each key must be exactly 32 bytes",
             SaltTooShort => "salt must be at least 8 bytes",
         },
     )

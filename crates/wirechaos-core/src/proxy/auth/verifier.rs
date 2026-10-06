@@ -1,5 +1,8 @@
 use crate::proxy::auth::error::AuthError;
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD as B64, STANDARD_NO_PAD as B64_NO_PAD},
+    Engine,
+};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::error::Error;
@@ -45,7 +48,15 @@ pub enum SecretFormatError {
 }
 
 pub trait VerifierProvider: Send + Sync + 'static {
-    async fn lookup(&self, username: &str) -> Result<Option<Arc<Verifier>>, ProviderError>;
+    /// Resolve a user to a verifier.
+    ///
+    /// The returned future is `Send` so the whole auth phase can run inside a
+    /// spawned session task; the three outcomes are `Ok(Some(..))` (verifier),
+    /// `Ok(None)` (no such user) and `Err(..)` (store unavailable).
+    fn lookup(
+        &self,
+        username: &str,
+    ) -> impl std::future::Future<Output = Result<Option<Arc<Verifier>>, ProviderError>> + Send;
 
     fn get_dummy_verifier(&self, username: &str) -> Verifier;
 }
@@ -64,8 +75,20 @@ pub struct Verifier {
 pub const MIN_ITERATIONS: u32 = 4096;
 
 impl Verifier {
-    pub fn from_password(password: &[u8], salt: &[u8], iterations: u32) -> Self {
-        let salted = pbkdf2_sha256(password, &salt, iterations);
+    /// Derive a verifier from a plaintext password.
+    ///
+    /// The caller is responsible for SASLprep preparation (see
+    /// [`crate::proxy::auth::credentials::secret::prepare_password`]); this
+    /// function hashes the bytes it is given so that PostgreSQL's raw-bytes
+    /// fallback for invalid UTF-8 stays expressible.
+    pub fn from_password(
+        password: impl AsRef<[u8]>,
+        salt: impl AsRef<[u8]>,
+        iterations: u32,
+    ) -> Self {
+        let password = password.as_ref();
+        let salt = salt.as_ref();
+        let salted = pbkdf2_sha256(password, salt, iterations);
         let client_key = hmac_sha256(&salted, b"Client Key");
         let server_key = hmac_sha256(&salted, b"Server Key");
 
@@ -142,16 +165,15 @@ impl Verifier {
         }
 
         let salt = Zeroizing::new(
-            B64.decode(salt)
-                .map_err(|_| SecretFormatError::Base64 { field: "salt" })?,
+            decode_b64(salt).map_err(|_| SecretFormatError::Base64 { field: "salt" })?,
         );
+
+        let stored_key = decode_key(stored_key, "StoredKey")?;
+        let server_key = decode_key(server_key, "ServerKey")?;
 
         if salt.len() < 8 {
             return Err(SecretFormatError::SaltTooShort);
         }
-
-        let stored_key = decode_key(stored_key, "Stored key")?;
-        let server_key = decode_key(server_key, "Server key")?;
 
         Ok(Verifier {
             iterations,
@@ -167,20 +189,27 @@ impl Verifier {
             "SCRAM-SHA-256${}:{}${}:{}",
             self.iterations,
             B64.encode(&self.salt),
-            B64.encode(&self.stored_key),
-            B64.encode(&self.server_key)
+            B64.encode(self.stored_key),
+            B64.encode(self.server_key)
         )
     }
 }
 
 fn decode_key(b64: &str, field: &'static str) -> Result<[u8; 32], SecretFormatError> {
-    let bytes = B64
-        .decode(b64)
-        .map_err(|_| SecretFormatError::Base64 { field: field })?;
+    let bytes = decode_b64(b64).map_err(|_| SecretFormatError::Base64 { field })?;
 
     bytes
         .try_into()
         .map_err(|_| SecretFormatError::KeyLength { field })
+}
+
+/// Decode standard base64, accepting the unpadded spelling too.
+///
+/// PostgreSQL always emits padding, but operators who hand-edit a `users.yaml`
+/// may trim it; accepting both is strictly more compatible and cannot make a
+/// malformed secret valid, because the decoded length is still checked.
+fn decode_b64(input: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    B64.decode(input).or_else(|_| B64_NO_PAD.decode(input))
 }
 
 pub fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
@@ -217,7 +246,7 @@ mod hygiene {
     #[test]
     fn keys_are_zeroized_on_drop() {
         let bytes = {
-            let v = Verifier::from_password(b"pencil", &[0x5a; 16], 4096);
+            let v = Verifier::from_password(b"pencil", [0x5a; 16], 4096);
             v.stored_key().to_vec()
         };
 
@@ -226,16 +255,16 @@ mod hygiene {
 
     #[test]
     fn explicit_zeroize_clears_the_key() {
-        let mut v = Verifier::from_password(b"pencil", &[0x5a; 16], 4096);
+        let mut v = Verifier::from_password(b"pencil", [0x5a; 16], 4096);
         v.zeroize();
-        assert_eq!(v.stored_key, [0u8; 32]);
-        assert_eq!(v.server_key, [0u8; 32]);
-        assert!(v.salt.iter().all(|&b| b == 0));
+        assert_eq!(v.stored_key(), &[0u8; 32]);
+        assert_eq!(v.server_key(), &[0u8; 32]);
+        assert!(v.salt().iter().all(|&b| b == 0));
     }
 
     #[test]
     fn secret_round_trips() {
-        let original = Verifier::from_password(b"pencil", &[0x11; 16], 4096);
+        let original = Verifier::from_password(b"pencil", [0x11; 16], 4096);
         let text = original.to_pg_secret();
         let parsed = Verifier::from_pg_secret(&text).expect("our own output must parse");
 
@@ -264,7 +293,11 @@ mod hygiene {
 
         for (input, expected) in cases {
             let result = Verifier::from_pg_secret(input);
-            assert!(matches!(result, Err(ref actual) if actual == expected));
+            assert!(
+                matches!(&result, Err(actual) if actual == expected),
+                "input {input:?}: expected {expected:?}, got {:?}",
+                result.as_ref().err()
+            );
         }
     }
 }

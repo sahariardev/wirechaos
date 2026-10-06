@@ -30,7 +30,12 @@ async fn ssl_request_promotes_connection_to_tls() {
 
     let server = tokio::spawn(async move {
         let (socket, _peer) = listener.accept().await.expect("accept");
-        let mut conn = Conn::new(socket, pool, Some(frontend_tls), TestVerifierProvider::new());
+        let mut conn = Conn::new(
+            socket,
+            pool,
+            Some(frontend_tls),
+            TestVerifierProvider::new(),
+        );
 
         // First call: read the SSLRequest, reply 'S', upgrade to TLS.
         conn.handle_startup()
@@ -313,7 +318,12 @@ async fn startup_over_tls_is_accepted_when_tls_is_required() {
 
     let server = tokio::spawn(async move {
         let (socket, _peer) = listener.accept().await.expect("accept");
-        let mut conn = Conn::new(socket, pool, Some(frontend_tls), TestVerifierProvider::new());
+        let mut conn = Conn::new(
+            socket,
+            pool,
+            Some(frontend_tls),
+            TestVerifierProvider::new(),
+        );
         conn.required_tls = true;
 
         // SSLRequest: reply 'S' and promote to TLS.

@@ -1,12 +1,10 @@
-use crate::proxy::ProxyError;
 use crate::proxy::replication_mode::ReplicationMode;
 use crate::proxy::replication_mode::ReplicationMode::{Logical, Off};
+use crate::proxy::ProxyError;
 use std::collections::HashMap;
 use tokio::io;
 
-pub fn parse_options(
-    options: String,
-) -> Result<HashMap<String, String>, ProxyError> {
+pub fn parse_options(options: String) -> Result<HashMap<String, String>, ProxyError> {
     let tokens = split_option_tokens(options);
     let mut result: HashMap<String, String> = HashMap::new();
     let mut i = 0;
@@ -107,9 +105,7 @@ pub fn split_option_tokens(s: String) -> Vec<String> {
     tokens
 }
 
-pub fn parse_replication_mode(
-    value: String,
-) -> Result<ReplicationMode, ProxyError> {
+pub fn parse_replication_mode(value: String) -> Result<ReplicationMode, ProxyError> {
     match value.to_lowercase().as_str() {
         "" | "false" | "off" | "no" | "0" | "f" | "n" => Ok(Off),
         "true" | "on" | "yes" | "1" | "t" | "y" => Ok(ReplicationMode::Physical),

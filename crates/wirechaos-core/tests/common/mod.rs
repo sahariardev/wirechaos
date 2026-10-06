@@ -12,7 +12,8 @@
 #![allow(dead_code)] // each test crate uses a different subset of these helpers
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::fmt;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -20,6 +21,9 @@ use rustls::{Certificate, PrivateKey, RootCertStore, ServerConfig, ServerName};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tracing::{Event, Subscriber};
+use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+use tracing_subscriber::util::SubscriberInitExt;
 use wirechaos_core::proxy::auth::verifier::{
     hmac_sha256, pbkdf2_sha256, sha256, ProviderError, Verifier, VerifierProvider,
 };
@@ -122,12 +126,16 @@ pub fn startup_message(params: &[u8]) -> Vec<u8> {
 
 /// The verifier the tests authenticate against: `PASSWORD` with a fixed salt.
 pub fn verifier(user_password: &str) -> Verifier {
-    Verifier::from_password(user_password, SALT.to_vec(), SALT_ITERATIONS)
+    Verifier::from_password(user_password, SALT, SALT_ITERATIONS)
 }
+
+/// A fixed cluster nonce so mock verifiers are deterministic across a test run.
+pub const DUMMY_NONCE: [u8; 32] = [0x42; 32];
 
 /// In-memory [`VerifierProvider`] covering the users one test needs.
 pub struct TestVerifierProvider {
-    users: HashMap<String, Verifier>,
+    users: HashMap<String, Arc<Verifier>>,
+    fail: bool,
 }
 
 impl TestVerifierProvider {
@@ -138,33 +146,51 @@ impl TestVerifierProvider {
 
     pub fn with_user(user: &str, password: &str) -> Self {
         let mut users = HashMap::new();
-        users.insert(user.to_string(), verifier(password));
+        users.insert(user.to_string(), Arc::new(verifier(password)));
 
-        Self { users }
+        Self { users, fail: false }
     }
 
     /// A provider that knows nobody: every lookup misses.
     pub fn empty() -> Self {
         Self {
             users: HashMap::new(),
+            fail: false,
         }
+    }
+
+    /// A provider that cannot be consulted: every lookup is an outage.
+    pub fn failing() -> Self {
+        Self {
+            users: HashMap::new(),
+            fail: true,
+        }
+    }
+
+    /// Add a user backed by an already-built verifier.
+    pub fn with_verifier(mut self, user: &str, verifier: Verifier) -> Self {
+        self.users.insert(user.to_string(), Arc::new(verifier));
+        self
     }
 }
 
 impl VerifierProvider for TestVerifierProvider {
     /// `Ok(None)` is the "no such user" answer; `Err` is reserved for a store
-    /// that could not be consulted. `ProviderError` currently has no variants,
-    /// so a store failure cannot be simulated from here yet.
-    fn lookup(&self, username: &str) -> Result<Option<Verifier>, ProviderError> {
+    /// that could not be consulted.
+    async fn lookup(&self, username: &str) -> Result<Option<Arc<Verifier>>, ProviderError> {
+        if self.fail {
+            return Err(ProviderError::Unavailable(
+                "test credential store down".into(),
+            ));
+        }
+
         Ok(self.users.get(username).cloned())
     }
 
     /// The mock verifier used for users that do not exist: deterministic, and
     /// marked `dummy` so `handle_client_final` always fails the proof check.
-    fn get_dummy_verifier(&self) -> Result<Verifier, ProviderError> {
-        let mut dummy = verifier("wirechaos-dummy-password");
-        dummy.dummy = true;
-        Ok(dummy)
+    fn get_dummy_verifier(&self, username: &str) -> Verifier {
+        Verifier::dummy(username, &DUMMY_NONCE)
     }
 }
 
@@ -340,6 +366,13 @@ pub async fn read_server_final<S: AsyncRead + Unpin>(stream: &mut S) -> String {
     String::from_utf8(body[4..].to_vec()).expect("server-final is utf-8")
 }
 
+/// Read an `AuthenticationOk` (`R` with sub-code 0) and assert its framing.
+pub async fn read_authentication_ok<S: AsyncRead + Unpin>(stream: &mut S) {
+    let (message_type, body) = read_message(stream).await;
+    assert_eq!(message_type, MSG_AUTH, "expected an authentication message");
+    assert_eq!(auth_sub_code(&body), 0, "expected AuthenticationOk");
+}
+
 /// Read an ErrorResponse and return its fields.
 pub async fn read_error<S: AsyncRead + Unpin>(stream: &mut S) -> HashMap<char, String> {
     let (message_type, body) = read_message(stream).await;
@@ -471,5 +504,67 @@ impl ScramClient {
     /// The server-final the client expects to be sent back.
     pub fn expected_server_final(&self) -> &str {
         &self.expected_server_final
+    }
+}
+
+// ---- test-only log capture ----
+
+static CAPTURED_LOGS: OnceLock<Mutex<String>> = OnceLock::new();
+
+#[derive(Default)]
+struct RecordingVisitor(String);
+
+impl tracing::field::Visit for RecordingVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+        if !self.0.is_empty() {
+            self.0.push(' ');
+        }
+        self.0.push_str(field.name());
+        self.0.push('=');
+        self.0.push_str(&format!("{value:?}"));
+    }
+}
+
+/// A `tracing` layer that appends every rendered event to a process-global
+/// buffer so a test can assert on the *absence* of secret material.
+struct CaptureLayer;
+
+impl<S: Subscriber> Layer<S> for CaptureLayer {
+    fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+        let mut visitor = RecordingVisitor::default();
+        event.record(&mut visitor);
+
+        if let Some(logs) = CAPTURED_LOGS.get() {
+            if let Ok(mut guard) = logs.lock() {
+                guard.push_str(&visitor.0);
+                guard.push('\n');
+            }
+        }
+    }
+}
+
+/// Starts (once per test binary) a global capture subscriber.
+pub struct LogCapture;
+
+impl LogCapture {
+    pub fn start() -> Self {
+        let logs = CAPTURED_LOGS.get_or_init(|| Mutex::new(String::new()));
+        if let Ok(mut guard) = logs.lock() {
+            guard.clear();
+        }
+
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let _ = tracing_subscriber::registry().with(CaptureLayer).try_init();
+        });
+
+        LogCapture
+    }
+
+    pub fn text(&self) -> String {
+        CAPTURED_LOGS
+            .get()
+            .and_then(|logs| logs.lock().ok().map(|guard| guard.clone()))
+            .unwrap_or_default()
     }
 }

@@ -6,7 +6,6 @@ pub trait AuthError: std::error::Error + Send + Sync {
     fn message(&self) -> &str;
 }
 
-
 pub enum AuthFailure {
     Rejected(Box<dyn AuthError>),
     Internal(ProxyError),

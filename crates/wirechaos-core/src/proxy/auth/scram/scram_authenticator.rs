@@ -106,8 +106,8 @@ impl<'a> ScramAuthenticator<'a> {
         let server_first = format!(
             "r={},s={},i={}",
             self.combined_nonce,
-            B64.encode(&self.verifier.salt),
-            self.verifier.iterations
+            B64.encode(self.verifier.salt()),
+            self.verifier.iterations()
         );
 
         self.server_first = server_first.clone();
@@ -192,7 +192,7 @@ impl<'a> ScramAuthenticator<'a> {
             return Err(malformed());
         }
 
-        let client_sig = hmac_sha256(&self.verifier.stored_key, auth_message.as_bytes());
+        let client_sig = hmac_sha256(self.verifier.stored_key(), auth_message.as_bytes());
         let recovered_client_key: Vec<u8> = proof
             .iter()
             .zip(client_sig.iter())
@@ -202,7 +202,7 @@ impl<'a> ScramAuthenticator<'a> {
         let recovered_stored_key = sha256(&recovered_client_key);
 
         if recovered_stored_key
-            .ct_eq(&self.verifier.stored_key[..])
+            .ct_eq(&self.verifier.stored_key()[..])
             .unwrap_u8()
             != 1
         {
@@ -216,7 +216,7 @@ impl<'a> ScramAuthenticator<'a> {
         // to make sure to execute all the hashing so that it prevents attacker to
         // identify user does not exist, once all kind of hasing operation done we are sending
         // auth failed
-        if self.verifier.dummy {
+        if self.verifier.is_dummy() {
             return Err(ScramError::AuthenticationFailed(format!(
                 "password authentication failed for user \"{}\"",
                 user
@@ -225,7 +225,7 @@ impl<'a> ScramAuthenticator<'a> {
 
         self.extracted_client_key = Some(recovered_client_key);
 
-        let server_sig = hmac_sha256(&self.verifier.server_key, auth_message.as_bytes());
+        let server_sig = hmac_sha256(self.verifier.server_key(), auth_message.as_bytes());
         Ok(format!("v={}", B64.encode(server_sig)))
     }
 
@@ -510,8 +510,12 @@ mod tests {
         let server_first = expect_ok(auth.handle_client_first(SCRAM_SHA_256, &client_first, USER));
         let client_first_bare = format!("n={USER},r={client_nonce}");
 
-        let (client_final, expected_server_final) =
-            simulate_client(password, &client_first_bare, &server_first, gs2_header.as_bytes());
+        let (client_final, expected_server_final) = simulate_client(
+            password,
+            &client_first_bare,
+            &server_first,
+            gs2_header.as_bytes(),
+        );
         let server_final = expect_ok(auth.handle_client_final(&client_final, ""));
         (server_final, expected_server_final)
     }
@@ -549,11 +553,8 @@ mod tests {
         // SaltedPassword = PBKDF2-HMAC-SHA256, then the two derived keys.
         let salted = pbkdf2_sha256(RFC_PASSWORD.as_bytes(), &salt, RFC_ITERATIONS);
         let client_key = hmac_sha256(&salted, b"Client Key");
-        assert_eq!(verifier.stored_key, sha256(&client_key).to_vec());
-        assert_eq!(
-            verifier.server_key,
-            hmac_sha256(&salted, b"Server Key").to_vec()
-        );
+        assert_eq!(verifier.stored_key(), &sha256(&client_key));
+        assert_eq!(verifier.server_key(), &hmac_sha256(&salted, b"Server Key"));
 
         // AuthMessage = client-first-bare + server-first + client-final-without-proof.
         let auth_message =
@@ -561,7 +562,7 @@ mod tests {
 
         // The published proof XOR ClientSignature must recover ClientKey, which
         // in turn must hash back to StoredKey.
-        let client_signature = hmac_sha256(&verifier.stored_key, auth_message.as_bytes());
+        let client_signature = hmac_sha256(verifier.stored_key(), auth_message.as_bytes());
         let proof = B64.decode(RFC_PROOF_B64).expect("RFC proof is base64");
         let recovered: Vec<u8> = proof
             .iter()
@@ -574,13 +575,13 @@ mod tests {
             "the RFC's proof must recover ClientKey"
         );
         assert_eq!(
-            sha256(&recovered).to_vec(),
-            verifier.stored_key,
+            sha256(&recovered),
+            *verifier.stored_key(),
             "the recovered ClientKey must hash to StoredKey"
         );
 
         // ServerSignature = HMAC(ServerKey, AuthMessage).
-        let server_signature = hmac_sha256(&verifier.server_key, auth_message.as_bytes());
+        let server_signature = hmac_sha256(verifier.server_key(), auth_message.as_bytes());
         assert_eq!(
             format!("v={}", B64.encode(server_signature)),
             RFC_SERVER_FINAL
@@ -615,8 +616,8 @@ mod tests {
             "r={}-{},s={},i={}",
             CLIENT_NONCE,
             server_nonce,
-            B64.encode(&v.salt),
-            v.iterations
+            B64.encode(v.salt()),
+            v.iterations()
         );
         assert_eq!(server_first, expected);
     }

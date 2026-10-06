@@ -1,5 +1,10 @@
-use std::fmt::{self};
+use std::fmt;
 
+/// One validation failure.
+///
+/// It deliberately holds only the *shape* of the problem — the user name, the
+/// field, and a fixed reason string. Secret values are never stored here, so a
+/// report can be pasted into a ticket without leaking anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EntryError {
     user: Option<String>,
@@ -10,34 +15,54 @@ struct EntryError {
 impl fmt::Display for EntryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.user {
-            Some(user) => write!(f, "user {user} : {} : {}", self.field, self.reason),
-            _ => write!(f, "field:{} reason: {}", self.field, self.reason),
+            Some(user) => write!(f, "user {user}: {}: {}", self.field, self.reason),
+            None => write!(f, "{}: {}", self.field, self.reason),
         }
     }
 }
 
-#[derive(Debug)]
+/// The aggregate of every validation failure in one credential source.
+///
+/// A store is never built from a partial parse: either every entry is valid or
+/// the caller gets the full list of entries that are not.
+#[derive(Debug, Clone)]
 pub struct ConfigError {
-    etries: Vec<EntryError>,
+    entries: Vec<EntryError>,
 }
 
 impl ConfigError {
     pub fn single(field: &'static str, reason: &'static str) -> Self {
         Self {
-            etries: vec![EntryError {
+            entries: vec![EntryError {
                 user: None,
                 field,
                 reason,
             }],
         }
     }
+
+    /// The number of distinct validation failures collected.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether no failure was recorded. A `ConfigError` value always contains at
+    /// least one entry, so this exists mainly to satisfy the `len`/`is_empty`
+    /// pairing clippy expects.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} credentials configuration errors", &self.etries.len())?;
+        write!(
+            f,
+            "{} credentials configuration error(s)",
+            &self.entries.len()
+        )?;
 
-        for entry in &self.etries {
+        for entry in &self.entries {
             write!(f, "\n - {entry}")?;
         }
 
@@ -69,9 +94,9 @@ impl ErrorBag {
         if self.is_empty() {
             Ok(())
         } else {
-            return Err(ConfigError {
-                etries: self.entries,
-            });
+            Err(ConfigError {
+                entries: self.entries,
+            })
         }
     }
 }

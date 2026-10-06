@@ -1,16 +1,14 @@
-use crate::proxy::ProxyError;
 use crate::proxy::auth::error::{AuthError, AuthFailure};
 use crate::proxy::auth::verifier::VerifierProvider;
 use crate::proxy::conn::Conn;
+use crate::proxy::ProxyError;
 use tracing::warn;
 
 const MSG_AUTH: u8 = b'R';
 const MSG_ERROR: u8 = b'E';
 
 impl<V: VerifierProvider> Conn<V> {
-    pub async fn handle_authentication(
-        &mut self,
-    ) -> Result<Option<Vec<u8>>, ProxyError> {
+    pub async fn handle_authentication(&mut self) -> Result<Option<Vec<u8>>, ProxyError> {
         match self.handle_scram_auth().await {
             Ok(client_key) => Ok(client_key),
             Err(AuthFailure::Rejected(error)) => {
@@ -45,12 +43,12 @@ impl<V: VerifierProvider> Conn<V> {
         Ok(())
     }
 
-    async fn send_protocol_error(
-        &mut self,
-        err: &dyn AuthError,
-    ) -> Result<(), ProxyError> {
-        self.write_message(MSG_ERROR, &prepare_error_buf("FATAL", err.code(), err.message()))
-            .await?;
+    async fn send_protocol_error(&mut self, err: &dyn AuthError) -> Result<(), ProxyError> {
+        self.write_message(
+            MSG_ERROR,
+            &prepare_error_buf("FATAL", err.code(), err.message()),
+        )
+        .await?;
         Ok(())
     }
 }

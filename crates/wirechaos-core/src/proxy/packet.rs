@@ -1,5 +1,5 @@
-use crate::proxy::ProxyError;
 use crate::proxy::buffer_pool::PooledBytes;
+use crate::proxy::ProxyError;
 
 pub struct MessageReader {
     buf: PooledBytes,
@@ -95,10 +95,7 @@ impl MessageReader {
         )))
     }
 
-    pub fn read_string_fixed_size(
-        &mut self,
-        size: i32,
-    ) -> Result<String, ProxyError> {
+    pub fn read_string_fixed_size(&mut self, size: i32) -> Result<String, ProxyError> {
         if self.remaining() < size as usize {
             return Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,

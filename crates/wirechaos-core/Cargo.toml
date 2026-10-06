@@ -30,6 +30,7 @@ x509-parser.workspace = true
 oid-registry.workspace = true
 zeroize = { version = "1.8", features = ["derive"] }
 arc-swap = "1.7"
+tokio-postgres.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "net", "io-util"] }

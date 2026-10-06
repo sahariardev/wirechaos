@@ -3,9 +3,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::proxy::auth::credentials::file::snapshot_from_yaml;
+use crate::proxy::auth::credentials::{auth_query::AuthQuerySource, file::snapshot_from_yaml};
 use arc_swap::ArcSwap;
-use x509_parser::nom::Err;
 
 use crate::proxy::auth::{
     credentials::report::ConfigError,
@@ -15,6 +14,8 @@ use crate::proxy::auth::{
 pub enum Source {
     FILE(std::path::PathBuf),
     MEMORY,
+    #[cfg(feature = "auth-query")]
+    AUTH_QUERY(AuthQuerySource),
 }
 
 pub struct Snapshot {

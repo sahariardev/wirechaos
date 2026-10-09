@@ -1,6 +1,7 @@
 pub type ProxyError = Box<dyn std::error::Error + Send + Sync>;
 
 pub mod auth;
+pub mod backend;
 pub mod buffer_pool;
 pub mod conn;
 mod conn_read;

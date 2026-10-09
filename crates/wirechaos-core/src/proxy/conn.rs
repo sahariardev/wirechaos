@@ -1,4 +1,7 @@
 use crate::proxy::auth::verifier::VerifierProvider;
+use crate::proxy::backend::connection::Backend;
+use crate::proxy::backend::pool::BackendPool;
+use crate::proxy::backend::session_key_secret::{self, SessionKeySecret};
 use crate::proxy::buffer_pool::{MultiBufferPool, PooledBytes};
 use crate::proxy::conn_read::ConnRead;
 use crate::proxy::conn_write::ConnWrite;
@@ -14,6 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpStream;
 
 pub struct Conn<V: VerifierProvider> {
+    pub conn_id: i32,
     pub buffer_reader: BufReader<ConnRead>,
     pub buffer_writer: BufWriter<ConnWrite>,
     pub pool: Arc<MultiBufferPool>,
@@ -28,6 +32,9 @@ pub struct Conn<V: VerifierProvider> {
     pub database: Option<String>,
     pub replication_mode: ReplicationMode,
     pub provider: V,
+    pub backend_pool: BackendPool,
+    pub session_key_secret: Option<SessionKeySecret>,
+    pub backend: Option<Arc<Backend>>,
 }
 
 const MAX_STARTUP_PACKET_LENGTH: u32 = 10000;
@@ -40,15 +47,22 @@ const PROTOCOL_MAJOR_VERSION: u32 = 3;
 const PROTOCOL_MINOR_VERSION: u32 = 0;
 const PROTOCOL_VERSION_NUMBER: u32 = (PROTOCOL_MAJOR_VERSION << 16) | PROTOCOL_MINOR_VERSION;
 
+const MSG_PARAMETER_STATUS: u8 = b'S';
+const MSG_KEY_SECRET: u8 = b'K';
+const MSG_READY_ACCEPT_QUERY: u8 = b'Z';
+
 impl<V: VerifierProvider> Conn<V> {
     pub fn new(
+        conn_id: i32,
         stream: TcpStream,
         pool: Arc<MultiBufferPool>,
         frontend_tls: Option<FrontendTls>,
         verifier_provider: V,
+        backend_pool: BackendPool,
     ) -> Self {
         let (read_half, write_half) = stream.into_split();
         Self {
+            conn_id,
             buffer_reader: BufReader::new(ConnRead::Plain(read_half)),
             buffer_writer: BufWriter::new(ConnWrite::Plain(write_half)),
             pool,
@@ -63,6 +77,9 @@ impl<V: VerifierProvider> Conn<V> {
             database: None,
             replication_mode: ReplicationMode::Off,
             provider: verifier_provider,
+            backend_pool,
+            session_key_secret: None,
+            backend: None,
         }
     }
 
@@ -167,6 +184,19 @@ impl<V: VerifierProvider> Conn<V> {
                 "authentication rejected",
             )));
         }
+
+        //todo:: using dummy backend now, in future we will add a proper backend
+        let session_key_secret = SessionKeySecret::new(self.conn_id);
+        let backend = Arc::new(Backend::default());
+
+        self.backend = Some(Arc::clone(&backend));
+        self.session_key_secret = Some(session_key_secret);
+        self.backend_pool
+            .add_new_backend(backend, self.conn_id, session_key_secret);
+
+        self.send_parameter_status().await?;
+        self.send_key_secret().await?;
+        self.send_ready_signal().await?;
 
         Ok(())
     }
@@ -325,4 +355,60 @@ impl<V: VerifierProvider> Conn<V> {
 
         Ok(())
     }
+
+    async fn send_parameter_status(&mut self) -> Result<(), ProxyError> {
+        let backend = match self.backend.as_ref() {
+            Some(value) => value,
+            None => {
+                return Err(Box::new(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid data",
+                )));
+            }
+        };
+
+        if backend.get_param_status_values().is_empty() {
+            return Ok(());
+        }
+
+        for (name, value) in backend.get_param_status_values() {
+            let mut buf = Vec::new();
+            put_cstr(&mut buf, &name);
+            put_cstr(&mut buf, &value);
+
+            self.write_message(MSG_PARAMETER_STATUS, &buf).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn send_key_secret(&mut self) -> Result<(), ProxyError> {
+        let session_key_secret = match self.session_key_secret {
+            Some(value) => value,
+            None => {
+                return Err(Box::new(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid data",
+                )));
+            }
+        };
+
+        let mut buf = Vec::new();
+        put_cstr(&mut buf, &session_key_secret.key.to_string());
+        put_cstr(&mut buf, &session_key_secret.secret.to_string());
+
+        self.write_message(MSG_KEY_SECRET, &buf).await?;
+        Ok(())
+    }
+
+    async fn send_ready_signal(&mut self) -> Result<(), ProxyError> {
+        let buf = vec![b'I', b'\0'];
+        self.write_message(MSG_READY_ACCEPT_QUERY, &buf).await?;
+        Ok(())
+    }
+}
+
+fn put_cstr(buf: &mut Vec<u8>, value: &str) {
+    buf.extend_from_slice(value.as_bytes());
+    buf.push(b'\0');
 }

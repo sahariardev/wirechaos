@@ -1,5 +1,6 @@
 use crate::proxy::buffer_pool::PooledBytes;
-use crate::proxy::ProxyError;
+use crate::proxy::error::{connection_error, ConnectionErrorInner::*, ProxyError};
+use crate::proxy::InternalError;
 
 pub struct MessageReader {
     buf: PooledBytes,
@@ -20,7 +21,7 @@ impl MessageReader {
     /// Part of the typed message model: unused until the protocol engine reads
     /// single-byte fields (doc/tasks/13-protocol-message-model.md).
     #[allow(dead_code)]
-    pub fn read_byte(&mut self) -> Result<u8, ProxyError> {
+    pub fn read_byte(&mut self) -> Result<u8, InternalError> {
         if self.remaining() == 0 {
             return Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -41,7 +42,7 @@ impl MessageReader {
     /// `Int16` fields such as `RowDescription` column counts
     /// (doc/tasks/13-protocol-message-model.md).
     #[allow(dead_code)]
-    pub fn read_u16(&mut self) -> Result<u16, ProxyError> {
+    pub fn read_u16(&mut self) -> Result<u16, InternalError> {
         if self.remaining() < 2 {
             return Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -58,10 +59,7 @@ impl MessageReader {
 
     pub fn read_u32(&mut self) -> Result<u32, ProxyError> {
         if self.remaining() < 4 {
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "Not enough bytes to read",
-            )));
+            return Err(connection_error(InvalidMessageLength));
         }
 
         let value = u32::from_be_bytes([
@@ -81,7 +79,8 @@ impl MessageReader {
 
         while self.pos < self.buf.len() {
             if self.buf[self.pos] == b'\0' {
-                let message = String::from_utf8(self.buf[start..self.pos].to_vec())?;
+                let message = String::from_utf8(self.buf[start..self.pos].to_vec())
+                    .map_err(ProxyError::internal)?;
                 self.pos += 1;
                 return Ok(message);
             }
@@ -89,25 +88,20 @@ impl MessageReader {
             self.pos += 1;
         }
 
-        Err(Box::new(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "Not enough bytes to read",
-        )))
+        Err(connection_error(InvalidMessageLength))
     }
 
     pub fn read_string_fixed_size(&mut self, size: i32) -> Result<String, ProxyError> {
         if self.remaining() < size as usize {
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "Not enough bytes to read",
-            )));
+            return Err(connection_error(InvalidMessageLength));
         }
 
         let start = self.pos;
         let end = self.pos + size as usize;
         self.pos = end;
 
-        let message = String::from_utf8(self.buf[start..end].to_vec())?;
+        let message =
+            String::from_utf8(self.buf[start..end].to_vec()).map_err(ProxyError::internal)?;
         Ok(message)
     }
 }

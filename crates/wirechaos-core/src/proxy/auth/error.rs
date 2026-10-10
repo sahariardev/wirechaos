@@ -1,4 +1,4 @@
-use crate::proxy::ProxyError;
+use crate::proxy::InternalError;
 use std::fmt;
 
 pub trait AuthError: std::error::Error + Send + Sync {
@@ -8,7 +8,7 @@ pub trait AuthError: std::error::Error + Send + Sync {
 
 pub enum AuthFailure {
     Rejected(Box<dyn AuthError>),
-    Internal(ProxyError),
+    Internal(InternalError),
 }
 
 impl AuthFailure {
@@ -16,7 +16,7 @@ impl AuthFailure {
         Self::Rejected(Box::new(error))
     }
 
-    pub fn internal(error: impl Into<ProxyError>) -> Self {
+    pub fn internal(error: impl Into<InternalError>) -> Self {
         Self::Internal(error.into())
     }
 }

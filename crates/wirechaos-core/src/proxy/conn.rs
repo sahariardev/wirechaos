@@ -1,22 +1,23 @@
 use crate::proxy::auth::verifier::VerifierProvider;
 use crate::proxy::backend::connection::Backend;
 use crate::proxy::backend::registry::Registry;
-use crate::proxy::backend::session_key_secret::{self, SessionKeySecret};
+use crate::proxy::backend::session_key_secret::SessionKeySecret;
 use crate::proxy::buffer_pool::{MultiBufferPool, PooledBytes};
 use crate::proxy::conn_read::ConnRead;
+use crate::proxy::conn_registry::ConnRegistry;
+use crate::proxy::conn_registry::MAX_CONCURRENT_CONNECCTION;
 use crate::proxy::conn_write::ConnWrite;
+use crate::proxy::error::{connection_error, ConnectionErrorInner::*, ProxyError};
 use crate::proxy::packet::MessageReader;
 use crate::proxy::replication_mode::ReplicationMode;
 use crate::proxy::startup_config_parse_util::{parse_options, parse_replication_mode};
 use crate::proxy::tls::FrontendTls;
-use crate::proxy::ProxyError;
+use crate::proxy::InternalError;
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-use tokio::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpStream;
-use x509_parser::nom::Err;
 
 pub struct Conn<V: VerifierProvider> {
     pub conn_id: i32,
@@ -37,6 +38,7 @@ pub struct Conn<V: VerifierProvider> {
     pub backend_registry: Registry,
     pub session_key_secret: Option<SessionKeySecret>,
     pub backend: Option<Arc<Backend>>,
+    pub conn_registry: ConnRegistry,
 }
 
 const MAX_STARTUP_PACKET_LENGTH: u32 = 10000;
@@ -52,6 +54,7 @@ const PROTOCOL_VERSION_NUMBER: u32 = (PROTOCOL_MAJOR_VERSION << 16) | PROTOCOL_M
 const MSG_PARAMETER_STATUS: u8 = b'S';
 const MSG_KEY_SECRET: u8 = b'K';
 const MSG_READY_ACCEPT_QUERY: u8 = b'Z';
+const MSG_ERROR: u8 = b'E';
 
 impl<V: VerifierProvider> Conn<V> {
     pub fn new(
@@ -61,6 +64,7 @@ impl<V: VerifierProvider> Conn<V> {
         frontend_tls: Option<FrontendTls>,
         verifier_provider: V,
         backend_pool: Registry,
+        conn_registry: ConnRegistry,
     ) -> Self {
         let (read_half, write_half) = stream.into_split();
         Self {
@@ -82,6 +86,7 @@ impl<V: VerifierProvider> Conn<V> {
             backend_registry: backend_pool,
             session_key_secret: None,
             backend: None,
+            conn_registry,
         }
     }
 
@@ -90,9 +95,24 @@ impl<V: VerifierProvider> Conn<V> {
     /// Implemented by the relay: see doc/tasks/06-relay-engine.md. The `allow` is
     /// deliberate and tracked there — the lint stays active for new code, while this
     /// known gap is visible rather than hidden.
-    #[allow(clippy::todo)]
-    pub async fn handle(&mut self) -> Result<(), ProxyError> {
-        todo!("handle message: implemented in task 6 (relay engine)")
+    pub async fn handle(&mut self) -> Result<(), InternalError> {
+        //two kind of error, one for we need to send message to client
+        // and another one we cannot do anything,
+        if self.conn_registry.get_concurrent_connection_count() >= MAX_CONCURRENT_CONNECCTION {
+            self.send_error_message("5330", "sorry too many clients alreay!")
+                .await?;
+            return Ok(());
+        }
+
+        match self.handle_startup().await {
+            Ok(()) => {}
+            Err(ProxyError::Internal(err)) => return Err(err),
+            Err(ProxyError::ConnectionError(err)) => {
+                self.send_error_message(err.code(), err.message()).await?;
+            }
+        };
+
+        Ok(())
     }
 
     pub async fn handle_startup(&mut self) -> Result<(), ProxyError> {
@@ -112,18 +132,29 @@ impl<V: VerifierProvider> Conn<V> {
 
             PROTOCOL_VERSION_NUMBER => {
                 if self.required_tls && !self.ssl_done {
-                    return Err(Box::new(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "TLS is required but the client did not request it",
-                    )));
+                    return Err(connection_error(TlsRequired));
                 }
 
                 self.handle_startup_packet(protocol_code, &mut message_reader)
                     .await?;
+                //here the loop will contnue
             }
-            _ => {}
+            invalid_version => {
+                self.handle_protocol_version_mismatch(invalid_version)
+                    .await?;
+            }
         }
 
+        Ok(())
+    }
+
+    pub async fn send_error_message(
+        &mut self,
+        code: &str,
+        message: &str,
+    ) -> Result<(), InternalError> {
+        self.write_message(MSG_ERROR, &prepare_error_buf("FATAL", code, message))
+            .await?;
         Ok(())
     }
 
@@ -179,12 +210,8 @@ impl<V: VerifierProvider> Conn<V> {
             // whose client never authenticated.
             //
             // todo:: close the socket explicitly, and let the session driver
-            // distinguish "rejected" from "faulted" once it exists
-            // (doc/tasks/06-relay-engine.md).
-            return Err(Box::new(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "authentication rejected",
-            )));
+            // distinguish "rejected" from "faulted" once it exist
+            return Err(connection_error(AuthFailed));
         }
 
         //todo:: using dummy backend now, in future we will add a proper backend
@@ -211,10 +238,7 @@ impl<V: VerifierProvider> Conn<V> {
         message_reader: &mut MessageReader,
     ) -> Result<(), ProxyError> {
         if message_reader.remaining() < 8 {
-            return Err(Box::new(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Invalid message length,",
-            )));
+            return Err(connection_error(InvalidMessageLength));
         }
 
         let pid = message_reader.read_u32()? as i32;
@@ -228,32 +252,51 @@ impl<V: VerifierProvider> Conn<V> {
 
     async fn handle_gssnc_request(&mut self) -> Result<(), ProxyError> {
         if self.gss_done {
-            return Err(Box::from("GSSENC Request is already done"));
+            return Err(connection_error(GssAlreadyDone));
         }
         self.gss_done = true;
 
-        self.buffer_writer.write_all(b"N").await?;
-        self.buffer_writer.flush().await?;
+        self.buffer_writer
+            .write_all(b"N")
+            .await
+            .map_err(ProxyError::internal)?;
+
+        self.buffer_writer
+            .flush()
+            .await
+            .map_err(ProxyError::internal)?;
 
         Ok(())
     }
     async fn handle_ssl_request(&mut self) -> Result<(), ProxyError> {
         if self.ssl_done {
-            return Err(Box::from("SSL Request is already done"));
+            return Err(connection_error(TlsAlreadyDone));
         }
         self.ssl_done = true;
 
         if self.frontend_tls.is_some() {
             // Offer TLS: the client expects 'S' and then runs the
             // handshake on this socket.
-            self.buffer_writer.write_all(b"S").await?;
-            self.buffer_writer.flush().await?;
+            self.buffer_writer
+                .write_all(b"S")
+                .await
+                .map_err(ProxyError::internal)?;
+            self.buffer_writer
+                .flush()
+                .await
+                .map_err(ProxyError::internal)?;
             self.promote_to_tls().await?;
         } else {
             // No TLS support configured: decline and keep the
             // connection in plaintext.
-            self.buffer_writer.write_all(b"N").await?;
-            self.buffer_writer.flush().await?;
+            self.buffer_writer
+                .write_all(b"N")
+                .await
+                .map_err(ProxyError::internal)?;
+            self.buffer_writer
+                .flush()
+                .await
+                .map_err(ProxyError::internal)?;
         }
 
         Ok(())
@@ -267,23 +310,28 @@ impl<V: VerifierProvider> Conn<V> {
             // The `ssl_done` guard should make this unreachable, but a panic here
             // would take down the whole session task. Report it as a protocol-level
             // error instead, so one connection fails loudly and the rest survive.
-            return Err(Box::new(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "TLS promotion requested on a connection that is not plaintext",
-            )));
+            return Err(connection_error(InvalidData));
         };
 
         let ConnWrite::Plain(write_half) = writer.into_inner() else {
-            return Err(Box::new(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "TLS promotion requested on a connection that is not plaintext",
-            )));
+            return Err(connection_error(InvalidData));
         };
 
-        let tcp = read_half.reunite(write_half)?;
-        let tls_acceptor = self.frontend_tls.as_ref().ok_or("TLS acceptor not set")?;
+        let tcp = read_half
+            .reunite(write_half)
+            .map_err(ProxyError::internal)?;
 
-        let tls = tls_acceptor.acceptor.accept(tcp).await?;
+        let tls_acceptor = self
+            .frontend_tls
+            .as_ref()
+            .ok_or("TLS acceptor not set")
+            .map_err(ProxyError::internal)?;
+
+        let tls = tls_acceptor
+            .acceptor
+            .accept(tcp)
+            .await
+            .map_err(ProxyError::internal)?;
 
         let (read_half, write_half) = tokio::io::split(tls);
         self.buffer_reader = BufReader::new(ConnRead::Tls(read_half));
@@ -293,14 +341,14 @@ impl<V: VerifierProvider> Conn<V> {
 
     pub async fn read_message_length(&mut self) -> Result<usize, ProxyError> {
         let mut hdr = [0u8; 4];
-        self.buffer_reader.read_exact(&mut hdr).await?;
+        self.buffer_reader
+            .read_exact(&mut hdr)
+            .await
+            .map_err(|err| ProxyError::Internal(Box::new(err)))?;
         let len = u32::from_be_bytes(hdr) as usize;
 
         if len < 4 {
-            return Err(Box::new(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Invalid message length: {}", len),
-            )));
+            return Err(connection_error(InvalidMessageLength));
         }
 
         Ok(len - 4)
@@ -310,18 +358,12 @@ impl<V: VerifierProvider> Conn<V> {
         let length = self.read_message_length().await?;
 
         if length > MAX_STARTUP_PACKET_LENGTH as usize {
-            return Err(Box::new(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Invalid message length: {}", length),
-            )));
+            return Err(connection_error(FirstMessageTooBig));
         }
 
         match self.read_message_body(length).await? {
             Some(message) => Ok(message),
-            None => Err(Box::new(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "Message body is empty",
-            ))),
+            None => Err(connection_error(EmptyMessageBody)),
         }
     }
 
@@ -334,34 +376,34 @@ impl<V: VerifierProvider> Conn<V> {
         }
 
         if length > self.pool.max_capacity() {
-            return Err(Box::new(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Invalid message length: {} exceeds buffer pool capacity {}",
-                    length,
-                    self.pool.max_capacity()
-                ),
-            )));
+            return Err(connection_error(InvalidMessageLength));
         }
 
         let pool = self.pool.clone();
 
         let mut buf = pool.get(length);
 
-        self.buffer_reader.read_exact(&mut buf).await?;
+        self.buffer_reader
+            .read_exact(&mut buf)
+            .await
+            .map_err(ProxyError::internal)?;
 
         Ok(Some(buf))
     }
 
     /// Write raw bytes to the peer over the current transport (plain or TLS)
     /// and flush. Used by the proxy to send protocol messages to the client.
-    pub async fn write_raw(&mut self, data: &[u8]) -> Result<(), ProxyError> {
+    pub async fn write_raw(&mut self, data: &[u8]) -> Result<(), InternalError> {
         self.buffer_writer.write_all(data).await?;
         self.buffer_writer.flush().await?;
         Ok(())
     }
 
-    pub async fn write_message(&mut self, message_type: u8, body: &[u8]) -> Result<(), ProxyError> {
+    pub async fn write_message(
+        &mut self,
+        message_type: u8,
+        body: &[u8],
+    ) -> Result<(), InternalError> {
         let len = (body.len() + 4) as u32;
         self.buffer_writer.write_all(&[message_type]).await?;
         self.buffer_writer.write_all(&len.to_be_bytes()).await?;
@@ -375,10 +417,7 @@ impl<V: VerifierProvider> Conn<V> {
         let backend = match self.backend.as_ref() {
             Some(value) => value,
             None => {
-                return Err(Box::new(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Invalid data",
-                )));
+                return Err(connection_error(InvalidData));
             }
         };
 
@@ -391,7 +430,9 @@ impl<V: VerifierProvider> Conn<V> {
             put_cstr(&mut buf, &name);
             put_cstr(&mut buf, &value);
 
-            self.write_message(MSG_PARAMETER_STATUS, &buf).await?;
+            self.write_message(MSG_PARAMETER_STATUS, &buf)
+                .await
+                .map_err(ProxyError::internal)?;
         }
 
         Ok(())
@@ -401,10 +442,7 @@ impl<V: VerifierProvider> Conn<V> {
         let session_key_secret = match self.session_key_secret {
             Some(value) => value,
             None => {
-                return Err(Box::new(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Invalid data",
-                )));
+                return Err(connection_error(InvalidState));
             }
         };
 
@@ -412,18 +450,60 @@ impl<V: VerifierProvider> Conn<V> {
         buf.extend_from_slice(&(session_key_secret.key as u32).to_be_bytes());
         buf.extend_from_slice(&(session_key_secret.secret as u32).to_be_bytes());
 
-        self.write_message(MSG_KEY_SECRET, &buf).await?;
+        self.write_message(MSG_KEY_SECRET, &buf)
+            .await
+            .map_err(ProxyError::internal)?;
         Ok(())
     }
 
     async fn send_ready_signal(&mut self) -> Result<(), ProxyError> {
         let buf = vec![b'I'];
-        self.write_message(MSG_READY_ACCEPT_QUERY, &buf).await?;
+        self.write_message(MSG_READY_ACCEPT_QUERY, &buf)
+            .await
+            .map_err(ProxyError::internal)?;
         Ok(())
+    }
+
+    async fn handle_protocol_version_mismatch(&mut self, version: u32) -> Result<(), ProxyError> {
+        let (major, minor) = (version >> 16, version & 0xffff);
+        let message =
+            format!("Invalid version {major}:{minor}. Supported version is from 3.0 to 3.0");
+
+        let mut response = Vec::new();
+        for (field, value) in [(b'S', "FATAL"), (b'C', "0A00"), (b'M', message.as_str())] {
+            response.push(field);
+            response.extend_from_slice(value.as_bytes());
+            response.push(b'\0');
+        }
+        response.push(b'\0');
+
+        self.write_message(b'E', &response)
+            .await
+            .map_err(ProxyError::internal)?;
+
+        Err(ProxyError::Internal(Box::new(io::Error::new(
+            io::ErrorKind::InvalidData,
+            message,
+        ))))
     }
 }
 
 fn put_cstr(buf: &mut Vec<u8>, value: &str) {
     buf.extend_from_slice(value.as_bytes());
     buf.push(b'\0');
+}
+
+fn prepare_error_buf(severity: &str, code: &str, message: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+
+    body.push(b'S');
+    put_cstr(&mut body, severity);
+    body.push(b'V');
+    put_cstr(&mut body, severity);
+    body.push(b'C');
+    put_cstr(&mut body, code);
+    body.push(b'M');
+    put_cstr(&mut body, message);
+    body.push(b'\0');
+    body
 }

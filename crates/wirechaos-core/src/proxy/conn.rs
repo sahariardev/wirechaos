@@ -1,6 +1,6 @@
 use crate::proxy::auth::verifier::VerifierProvider;
 use crate::proxy::backend::connection::Backend;
-use crate::proxy::backend::pool::BackendPool;
+use crate::proxy::backend::registry::Registry;
 use crate::proxy::backend::session_key_secret::{self, SessionKeySecret};
 use crate::proxy::buffer_pool::{MultiBufferPool, PooledBytes};
 use crate::proxy::conn_read::ConnRead;
@@ -11,10 +11,12 @@ use crate::proxy::startup_config_parse_util::{parse_options, parse_replication_m
 use crate::proxy::tls::FrontendTls;
 use crate::proxy::ProxyError;
 use std::collections::HashMap;
+use std::io;
 use std::sync::Arc;
 use tokio::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpStream;
+use x509_parser::nom::Err;
 
 pub struct Conn<V: VerifierProvider> {
     pub conn_id: i32,
@@ -32,7 +34,7 @@ pub struct Conn<V: VerifierProvider> {
     pub database: Option<String>,
     pub replication_mode: ReplicationMode,
     pub provider: V,
-    pub backend_pool: BackendPool,
+    pub backend_registry: Registry,
     pub session_key_secret: Option<SessionKeySecret>,
     pub backend: Option<Arc<Backend>>,
 }
@@ -58,7 +60,7 @@ impl<V: VerifierProvider> Conn<V> {
         pool: Arc<MultiBufferPool>,
         frontend_tls: Option<FrontendTls>,
         verifier_provider: V,
-        backend_pool: BackendPool,
+        backend_pool: Registry,
     ) -> Self {
         let (read_half, write_half) = stream.into_split();
         Self {
@@ -77,7 +79,7 @@ impl<V: VerifierProvider> Conn<V> {
             database: None,
             replication_mode: ReplicationMode::Off,
             provider: verifier_provider,
-            backend_pool,
+            backend_registry: backend_pool,
             session_key_secret: None,
             backend: None,
         }
@@ -186,13 +188,13 @@ impl<V: VerifierProvider> Conn<V> {
         }
 
         //todo:: using dummy backend now, in future we will add a proper backend
-        let session_key_secret = SessionKeySecret::new(self.conn_id);
+        let session_key_secret = SessionKeySecret::new();
         let backend = Arc::new(Backend::default());
 
         self.backend = Some(Arc::clone(&backend));
         self.session_key_secret = Some(session_key_secret);
-        self.backend_pool
-            .add_new_backend(backend, self.conn_id, session_key_secret);
+        self.backend_registry
+            .register(backend, self.conn_id, session_key_secret);
 
         self.send_parameter_status().await?;
         self.send_key_secret().await?;
@@ -204,13 +206,26 @@ impl<V: VerifierProvider> Conn<V> {
     /// Route a `CancelRequest` to the session it names.
     ///
     /// Implemented by the session registry: see doc/tasks/09-session-registry.md.
-    #[allow(clippy::todo)]
     fn handle_cancel_request(
         &mut self,
-        _message_reader: &mut MessageReader,
+        message_reader: &mut MessageReader,
     ) -> Result<(), ProxyError> {
-        todo!("handle cancel request: implemented in task 9 (session registry)")
+        if message_reader.remaining() < 8 {
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid message length,",
+            )));
+        }
+
+        let pid = message_reader.read_u32()? as i32;
+        let secret = message_reader.read_u32()? as i32;
+
+        let session_key_secret = SessionKeySecret { key: pid, secret };
+        self.backend_registry.cancel_request(session_key_secret);
+
+        Ok(())
     }
+
     async fn handle_gssnc_request(&mut self) -> Result<(), ProxyError> {
         if self.gss_done {
             return Err(Box::from("GSSENC Request is already done"));
@@ -393,16 +408,16 @@ impl<V: VerifierProvider> Conn<V> {
             }
         };
 
-        let mut buf = Vec::new();
-        put_cstr(&mut buf, &session_key_secret.key.to_string());
-        put_cstr(&mut buf, &session_key_secret.secret.to_string());
+        let mut buf = Vec::with_capacity(8);
+        buf.extend_from_slice(&(session_key_secret.key as u32).to_be_bytes());
+        buf.extend_from_slice(&(session_key_secret.secret as u32).to_be_bytes());
 
         self.write_message(MSG_KEY_SECRET, &buf).await?;
         Ok(())
     }
 
     async fn send_ready_signal(&mut self) -> Result<(), ProxyError> {
-        let buf = vec![b'I', b'\0'];
+        let buf = vec![b'I'];
         self.write_message(MSG_READY_ACCEPT_QUERY, &buf).await?;
         Ok(())
     }

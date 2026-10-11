@@ -5,7 +5,6 @@ use crate::proxy::backend::session_key_secret::SessionKeySecret;
 use crate::proxy::buffer_pool::{MultiBufferPool, PooledBytes};
 use crate::proxy::conn_read::ConnRead;
 use crate::proxy::conn_registry::ConnRegistry;
-use crate::proxy::conn_registry::MAX_CONCURRENT_CONNECCTION;
 use crate::proxy::conn_write::ConnWrite;
 use crate::proxy::error::{connection_error, ConnectionErrorInner::*, ProxyError};
 use crate::proxy::packet::MessageReader;
@@ -96,13 +95,11 @@ impl<V: VerifierProvider> Conn<V> {
     /// deliberate and tracked there — the lint stays active for new code, while this
     /// known gap is visible rather than hidden.
     pub async fn handle(&mut self) -> Result<(), InternalError> {
-        //two kind of error, one for we need to send message to client
-        // and another one we cannot do anything,
-        if self.conn_registry.get_concurrent_connection_count() >= MAX_CONCURRENT_CONNECCTION {
-            self.send_error_message("5330", "sorry too many clients alreay!")
+        let Some(_permit) = self.conn_registry.try_acquire() else {
+            self.send_error_message("53300", "sorry, too many connection")
                 .await?;
             return Ok(());
-        }
+        };
 
         match self.handle_startup().await {
             Ok(()) => {}
@@ -245,7 +242,16 @@ impl<V: VerifierProvider> Conn<V> {
         let secret = message_reader.read_u32()? as i32;
 
         let session_key_secret = SessionKeySecret { key: pid, secret };
-        self.backend_registry.cancel_request(session_key_secret);
+
+        match self.backend_registry.lookup_by_key(session_key_secret) {
+            Some(_backend) => {
+                //todo
+            }
+            None => tracing::debug!(
+                session_pid = pid,
+                "cancel request for an unknow or stale session; ignoring"
+            ),
+        }
 
         Ok(())
     }

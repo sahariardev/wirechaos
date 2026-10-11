@@ -1,6 +1,6 @@
 use rand::{thread_rng, Rng};
 //todo:: zeroing
-#[derive(Hash, PartialEq, Eq, Clone, Copy)]
+#[derive(Hash, PartialEq, Eq, Clone, Copy, Default)]
 pub struct SessionKeySecret {
     pub key: i32,
     pub secret: i32,

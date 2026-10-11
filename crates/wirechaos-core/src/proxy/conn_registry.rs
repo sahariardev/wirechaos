@@ -2,20 +2,90 @@ use std::sync::{Arc, PoisonError, RwLock};
 
 pub const MAX_CONCURRENT_CONNECCTION: u32 = 100;
 
-//todo:: think about locking in future
 pub struct ConnRegistry {
     inner: Arc<RwLock<Inner>>,
 }
 
+impl Clone for ConnRegistry {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
 struct Inner {
-    total_concurrent_connection_count: u32,
+    live: u32,
+    max: u32,
 }
 
 impl ConnRegistry {
-    pub fn get_concurrent_connection_count(&self) -> u32 {
+    pub fn new(max: u32) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(Inner { live: 0, max })),
+        }
+    }
+
+    pub fn try_acquire(&self) -> Option<ConnPermit> {
+        let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
+
+        if inner.live >= inner.max {
+            return None;
+        }
+
+        inner.live += 1;
+        Some(ConnPermit {
+            registry: self.clone(),
+        })
+    }
+
+    pub fn live(&self) -> u32 {
         self.inner
             .read()
             .unwrap_or_else(PoisonError::into_inner)
-            .total_concurrent_connection_count
+            .live
+    }
+}
+
+pub struct ConnPermit {
+    registry: ConnRegistry,
+}
+
+impl Drop for ConnPermit {
+    fn drop(&mut self) {
+        let mut inner = self
+            .registry
+            .inner
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        inner.live = inner.live.saturating_sub(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permit_is_release_on_drop() {
+        let registry = ConnRegistry::new(2);
+        let a = registry.try_acquire().expect("first slot");
+        let _b = registry.try_acquire().expect("second slot");
+
+        assert!(registry.try_acquire().is_none(), "third must be refused");
+        drop(a);
+        assert!(registry.try_acquire().is_some(), "free slot is reusable");
+    }
+
+    #[test]
+    fn clone_share_the_counter() {
+        let registry = ConnRegistry::new(1);
+        let clone = registry.clone();
+
+        let _ = registry.try_acquire();
+        assert!(
+            clone.try_acquire().is_none(),
+            "clones must share the same count"
+        );
     }
 }

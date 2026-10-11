@@ -25,9 +25,7 @@ impl<V: VerifierProvider> Conn<V> {
                     "authentication rejected"
                 );
 
-                self.send_protocol_error(error.as_ref())
-                    .await
-                    .map_err(ProxyError::internal)?;
+                self.send_protocol_error(error.as_ref()).await?;
                 Ok(None)
             }
             Err(AuthFailure::Internal(error)) => Err(ProxyError::internal(error)),

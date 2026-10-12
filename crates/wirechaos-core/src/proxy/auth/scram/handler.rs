@@ -1,5 +1,5 @@
 use crate::proxy::auth::error::AuthFailure;
-use crate::proxy::auth::scram::error::ScramError;
+use crate::proxy::auth::scram::error::{map_proxy_error_auth_error, ScramError};
 use crate::proxy::auth::scram::scram_authenticator::ScramAuthenticator;
 use crate::proxy::auth::verifier::VerifierProvider;
 use crate::proxy::buffer_pool::PooledBytes;
@@ -99,7 +99,7 @@ impl<V: VerifierProvider> Conn<V> {
         let len = self
             .read_message_length()
             .await
-            .map_err(AuthFailure::internal)?;
+            .map_err(map_proxy_error_auth_error)?;
 
         if len < 4 {
             return Err(AuthFailure::rejected(ScramError::Protocol(
@@ -110,7 +110,7 @@ impl<V: VerifierProvider> Conn<V> {
         let Some(message_buf) = self
             .read_message_body(len)
             .await
-            .map_err(AuthFailure::internal)?
+            .map_err(map_proxy_error_auth_error)?
         else {
             return Err(AuthFailure::rejected(ScramError::Protocol(
                 "message body empty".to_owned(),
@@ -127,7 +127,7 @@ impl<V: VerifierProvider> Conn<V> {
 
         let mut message = MessageReader::new(message_buf);
 
-        let mechanism = message.read_string().map_err(AuthFailure::internal)?;
+        let mechanism = message.read_string().map_err(map_proxy_error_auth_error)?;
 
         if !mechanics.contains(&mechanism.as_str()) {
             return Err(AuthFailure::rejected(ScramError::Protocol(
@@ -135,7 +135,7 @@ impl<V: VerifierProvider> Conn<V> {
             )));
         }
 
-        let data_len = message.read_u32().map_err(AuthFailure::internal)? as i32;
+        let data_len = message.read_u32().map_err(map_proxy_error_auth_error)? as i32;
 
         if data_len < 0 {
             return Err(AuthFailure::rejected(ScramError::Protocol(

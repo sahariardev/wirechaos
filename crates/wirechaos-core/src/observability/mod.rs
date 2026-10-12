@@ -1,7 +1,7 @@
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-pub fn init_logging() {
-    let filter_layer = EnvFilter::try_from_default_env()
+pub fn init_logging() -> anyhow::Result<()> {
+    let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("wirechaos=info,wirechaos_core=info,warn"));
 
     let fmt_layer = fmt::layer()
@@ -10,8 +10,11 @@ pub fn init_logging() {
         .with_line_number(true)
         .with_file(false);
 
-    let _ = tracing_subscriber::registry()
-        .with(filter_layer)
+    tracing_subscriber::registry()
+        .with(filter)
         .with(fmt_layer)
-        .try_init();
+        .try_init()
+        .map_err(|error| anyhow::anyhow!("failed to install the tracing subscriber: {error}"))?;
+
+    Ok(())
 }

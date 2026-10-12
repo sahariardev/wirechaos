@@ -12,7 +12,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use wirechaos_core::proxy::auth::credentials::CredentialStore;
 use wirechaos_core::proxy::auth::verifier::{Verifier, VerifierProvider};
-use wirechaos_core::proxy::conn::Conn;
 
 /// Spawn a server that accepts one connection, pretends the startup message
 /// already supplied `user`, and runs the authentication exchange.
@@ -23,14 +22,13 @@ async fn spawn_auth_server<V>(
 where
     V: VerifierProvider,
 {
-    let pool = buffer_pool();
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
     let user = user.map(str::to_string);
 
     let server = tokio::spawn(async move {
         let (socket, _peer) = listener.accept().await.expect("accept");
-        let mut conn = Conn::new(socket, pool, None, provider);
+        let mut conn = test_conn_for(socket, None, provider);
         conn.user = user;
 
         conn.handle_authentication()

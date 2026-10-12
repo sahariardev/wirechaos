@@ -1,4 +1,7 @@
-use crate::proxy::auth::error::AuthError;
+use crate::proxy::{
+    auth::error::{AuthError, AuthFailure},
+    error::ProxyError,
+};
 use std::error::Error;
 
 #[derive(Debug)]
@@ -48,5 +51,15 @@ impl std::fmt::Display for ScramError {
                 write!(f, "{}", self.message())
             }
         }
+    }
+}
+
+pub fn map_proxy_error_auth_error(err: ProxyError) -> AuthFailure {
+    match err {
+        ProxyError::Internal(e) => AuthFailure::internal(e),
+        ProxyError::ConnectionError(e) => AuthFailure::Internal(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            e.message().to_owned(),
+        ))),
     }
 }

@@ -1,9 +1,13 @@
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use clap::{Parser, Subcommand, ValueEnum};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use zeroize::Zeroizing;
 
 use wirechaos_core::proxy::auth::credentials::hash_password;
 use wirechaos_core::proxy::auth::verifier::MIN_ITERATIONS;
+use wirechaos_core::proxy::config::Config;
+use wirechaos_core::proxy::server::{run_server, ServerConfig};
 
 #[derive(Parser)]
 #[command(name = "wirechaos")]
@@ -16,7 +20,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Start the chaos proxy server
-    Proxy,
+    Proxy {
+        /// Path to `wirechaos.yaml`.
+        #[arg(long, default_value = "wirechaos.yaml")]
+        config: PathBuf,
+    },
     /// Run a specific testing scenario
     Scenario,
     /// Check system dependencies and environment health
@@ -54,22 +62,32 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // The `hash-password` output is meant to be piped, so it must not share
-    // stdout with a log banner.
+    // stdout with a log banner. Every other subcommand installs the subscriber
+    // exactly once, here — `init_core`'s hidden second initialiser is gone.
     if !matches!(cli.command, Commands::HashPassword { .. }) {
-        tracing_subscriber::registry()
-            .with(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| "info".into()),
-            )
-            .with(tracing_subscriber::fmt::layer())
-            .init();
-
-        wirechaos_core::init_core();
+        wirechaos_core::init_logging()?;
     }
 
     match &cli.command {
-        Commands::Proxy => {
-            tracing::info!("Starting proxy mode...");
+        Commands::Proxy { config } => {
+            let text = std::fs::read_to_string(config)?;
+            let parsed = Config::from_yaml(&text)?;
+
+            let bind = parsed.frontend_addr()?;
+            let credentials = parsed.build_credential_store().await?;
+
+            let server_config = ServerConfig {
+                bind,
+                config: Arc::new(parsed),
+                credentials,
+                // TLS material is loaded by task 2; the listener is
+                // plaintext-only until then.
+                frontend_tls: None,
+                pool_min: 4,
+                pool_max: 1 << 20,
+            };
+
+            run_server(server_config).await?;
         }
         Commands::Scenario => {
             tracing::info!("Running chaos scenario...");

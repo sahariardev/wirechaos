@@ -1790,7 +1790,6 @@ dependencies = [
  "rpassword",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "wirechaos-core",
  "zeroize",
 ]

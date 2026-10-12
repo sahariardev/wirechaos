@@ -27,7 +27,6 @@ use common::*;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
-use wirechaos_core::proxy::conn::Conn;
 
 /// Spawn a server that accepts one connection, pretends the startup message
 /// already supplied `user`, and runs the authentication exchange.
@@ -39,13 +38,12 @@ async fn spawn_auth_server(
     provider: TestVerifierProvider,
     user: Option<&'static str>,
 ) -> (SocketAddr, JoinHandle<Result<Option<Vec<u8>>, String>>) {
-    let pool = buffer_pool();
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
 
     let server = tokio::spawn(async move {
         let (socket, _peer) = listener.accept().await.expect("accept");
-        let mut conn = Conn::new(socket, pool, None, provider);
+        let mut conn = test_conn_for(socket, None, provider);
         conn.user = user.map(str::to_string);
 
         conn.handle_authentication()

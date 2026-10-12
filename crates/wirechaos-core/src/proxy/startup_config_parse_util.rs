@@ -1,8 +1,7 @@
+use crate::proxy::error::{connection_error, ConnectionErrorInner::*, ProxyError};
 use crate::proxy::replication_mode::ReplicationMode;
 use crate::proxy::replication_mode::ReplicationMode::{Logical, Off};
-use crate::proxy::ProxyError;
 use std::collections::HashMap;
-use tokio::io;
 
 pub fn parse_options(options: String) -> Result<HashMap<String, String>, ProxyError> {
     let tokens = split_option_tokens(options);
@@ -16,12 +15,7 @@ pub fn parse_options(options: String) -> Result<HashMap<String, String>, ProxyEr
             //"-c key=value"
             "-c" => {
                 i += 1;
-                let value_token = tokens.get(i).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("missing value after -c: {}", i),
-                    )
-                })?;
+                let value_token = tokens.get(i).ok_or_else(|| connection_error(InvalidData))?;
 
                 let (key, value) = split_key_value(value_token)?;
 
@@ -43,10 +37,7 @@ pub fn parse_options(options: String) -> Result<HashMap<String, String>, ProxyEr
                 result.insert(key, value.to_string());
             }
             _ => {
-                return Err(Box::new(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Unsupported option",
-                )))
+                return Err(connection_error(InvalidData));
             }
         }
 
@@ -59,13 +50,10 @@ pub fn parse_options(options: String) -> Result<HashMap<String, String>, ProxyEr
 fn split_key_value(token: &str) -> Result<(&str, &str), ProxyError> {
     let (key, value) = token
         .split_once('=')
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid key/value size"))?;
+        .ok_or_else(|| connection_error(InvalidData))?;
 
     if key.is_empty() || value.is_empty() {
-        return Err(Box::new(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid key/value size",
-        )));
+        return Err(connection_error(InvalidData));
     }
 
     Ok((key, value))
@@ -110,10 +98,7 @@ pub fn parse_replication_mode(value: String) -> Result<ReplicationMode, ProxyErr
         "" | "false" | "off" | "no" | "0" | "f" | "n" => Ok(Off),
         "true" | "on" | "yes" | "1" | "t" | "y" => Ok(ReplicationMode::Physical),
         "database" => Ok(Logical),
-        _ => Err(Box::new(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid value",
-        ))),
+        _ => Err(connection_error(InvalidData)),
     }
 }
 
@@ -223,13 +208,13 @@ mod tests {
     fn parse_rejects_joined_dash_c_without_equals() {
         // A missing '=' must be an error, not a panic on the client's input.
         let err = parse_options("-ck".to_string()).unwrap_err();
-        assert_eq!(err.to_string(), "invalid key/value size");
+        assert_eq!(err.to_string(), "invalid data");
     }
 
     #[test]
     fn parse_rejects_double_dash_without_equals() {
         let err = parse_options("--connection-limit".to_string()).unwrap_err();
-        assert_eq!(err.to_string(), "invalid key/value size");
+        assert_eq!(err.to_string(), "invalid data");
     }
 
     #[test]
@@ -242,30 +227,30 @@ mod tests {
     #[test]
     fn parse_rejects_missing_value_after_dash_c() {
         let err = parse_options("-c".to_string()).unwrap_err();
-        assert_eq!(err.to_string(), "missing value after -c: 1");
+        assert_eq!(err.to_string(), "invalid data");
     }
 
     #[test]
     fn parse_rejects_empty_value() {
         let err = parse_options("-ck=".to_string()).unwrap_err();
-        assert_eq!(err.to_string(), "invalid key/value size");
+        assert_eq!(err.to_string(), "invalid data");
     }
 
     #[test]
     fn parse_rejects_empty_key() {
         let err = parse_options("-c=v".to_string()).unwrap_err();
-        assert_eq!(err.to_string(), "invalid key/value size");
+        assert_eq!(err.to_string(), "invalid data");
     }
 
     #[test]
     fn parse_rejects_double_dash_with_empty_value() {
         let err = parse_options("--foo=".to_string()).unwrap_err();
-        assert_eq!(err.to_string(), "invalid key/value size");
+        assert_eq!(err.to_string(), "invalid data");
     }
 
     #[test]
     fn parse_rejects_unsupported_option() {
         let err = parse_options("garbage".to_string()).unwrap_err();
-        assert_eq!(err.to_string(), "Unsupported option");
+        assert_eq!(err.to_string(), "invalid data");
     }
 }

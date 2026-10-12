@@ -13,12 +13,14 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use rustls::{Certificate, PrivateKey, RootCertStore, ServerConfig, ServerName};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::{Event, Subscriber};
@@ -27,7 +29,11 @@ use tracing_subscriber::util::SubscriberInitExt;
 use wirechaos_core::proxy::auth::verifier::{
     hmac_sha256, pbkdf2_sha256, sha256, ProviderError, Verifier, VerifierProvider,
 };
+use wirechaos_core::proxy::backend::registry::Registry;
 use wirechaos_core::proxy::buffer_pool::MultiBufferPool;
+use wirechaos_core::proxy::config::Config;
+use wirechaos_core::proxy::conn::Conn;
+use wirechaos_core::proxy::conn_registry::ConnRegistry;
 use wirechaos_core::proxy::tls::FrontendTls;
 
 /// (1234 << 16) | 5679 — the SSLRequest startup-message code.
@@ -64,6 +70,173 @@ pub const IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// to land on an exact bucket size.
 pub fn buffer_pool() -> Arc<MultiBufferPool> {
     MultiBufferPool::new(4, 1024, 4)
+}
+
+/// The default configuration, wrapped for sharing with a [`Conn`].
+pub fn test_config() -> Arc<Config> {
+    Arc::new(Config::default())
+}
+
+/// A [`Conn`] backed by the in-memory test provider and a fresh registry.
+pub fn test_conn(
+    socket: TcpStream,
+    frontend_tls: Option<FrontendTls>,
+) -> Conn<TestVerifierProvider> {
+    test_conn_with(
+        socket,
+        frontend_tls,
+        Registry::new(),
+        ConnRegistry::new(100),
+    )
+}
+
+/// As [`test_conn`], but with caller-supplied registries (limit/cancel tests).
+pub fn test_conn_with(
+    socket: TcpStream,
+    frontend_tls: Option<FrontendTls>,
+    registry: Registry,
+    conn_registry: ConnRegistry,
+) -> Conn<TestVerifierProvider> {
+    Conn::new(
+        0,
+        socket,
+        buffer_pool(),
+        frontend_tls,
+        TestVerifierProvider::new(),
+        registry,
+        conn_registry,
+        test_config(),
+    )
+}
+
+/// A [`Conn`] over an arbitrary verifier provider (used by the auth-only tests
+/// that call `handle_authentication` directly).
+pub fn test_conn_for<V: VerifierProvider>(
+    socket: TcpStream,
+    frontend_tls: Option<FrontendTls>,
+    provider: V,
+) -> Conn<V> {
+    Conn::new(
+        0,
+        socket,
+        buffer_pool(),
+        frontend_tls,
+        provider,
+        Registry::new(),
+        ConnRegistry::new(100),
+        test_config(),
+    )
+}
+
+/// Bind an ephemeral listener that accepts one connection and drives
+/// [`Conn::handle`] to completion.
+///
+/// The shared registries and config control capacity, the auth deadline, and
+/// cancel routing, so the same helper serves the happy path and the
+/// limit/timeout/cancel tests.
+pub async fn spawn_startup_server(
+    registry: Registry,
+    conn_registry: ConnRegistry,
+    config: Arc<Config>,
+) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+
+    tokio::spawn(async move {
+        let (socket, _peer) = listener.accept().await.expect("accept");
+        let mut conn = Conn::new(
+            0,
+            socket,
+            buffer_pool(),
+            None,
+            TestVerifierProvider::new(),
+            registry,
+            conn_registry,
+            config,
+        );
+
+        let _ = conn.handle().await;
+    });
+
+    addr
+}
+
+/// Parse a `ParameterStatus` body: `name\0value\0`.
+pub fn parse_parameter_status(body: &[u8]) -> (String, String) {
+    let mut fields = body.split(|&byte| byte == 0);
+    let name =
+        String::from_utf8(fields.next().unwrap_or_default().to_vec()).expect("name is utf-8");
+    let value =
+        String::from_utf8(fields.next().unwrap_or_default().to_vec()).expect("value is utf-8");
+
+    (name, value)
+}
+
+/// Parse a `BackendKeyData` body: two big-endian `Int32`s.
+pub fn parse_backend_key_data(body: &[u8]) -> (i32, i32) {
+    assert_eq!(body.len(), 8, "BackendKeyData body is two Int32s");
+
+    let pid = i32::from_be_bytes(body[0..4].try_into().unwrap());
+    let secret = i32::from_be_bytes(body[4..8].try_into().unwrap());
+
+    (pid, secret)
+}
+
+/// The messages a client waits for after authentication.
+pub struct PostAuth {
+    pub parameters: Vec<(String, String)>,
+    pub backend_key: Option<(i32, i32)>,
+    pub ready_status: u8,
+}
+
+/// Read `AuthenticationOk`, `ParameterStatus*`, `BackendKeyData`, and
+/// `ReadyForQuery`, in that order.
+pub async fn read_post_auth_sequence<S: AsyncRead + Unpin>(stream: &mut S) -> PostAuth {
+    read_authentication_ok(stream).await;
+
+    let mut parameters = Vec::new();
+    let mut backend_key = None;
+
+    let ready_status = loop {
+        let (message_type, body) = read_message(stream).await;
+
+        match message_type {
+            b'S' => parameters.push(parse_parameter_status(&body)),
+            b'K' => backend_key = Some(parse_backend_key_data(&body)),
+            b'Z' => break body[0],
+            other => panic!(
+                "unexpected message {:?} during the post-auth sequence",
+                other as char
+            ),
+        }
+    };
+
+    PostAuth {
+        parameters,
+        backend_key,
+        ready_status,
+    }
+}
+
+/// Drive a client through startup + SCRAM and read the post-auth sequence.
+pub async fn complete_startup_and_auth<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+) -> PostAuth {
+    let startup = format!("user\x00{USER}\x00\x00");
+    write_startup_payload(stream, &startup_message(startup.as_bytes())).await;
+
+    let mut client = ScramClient::new(USER, PASSWORD, CLIENT_NONCE);
+    begin_sasl(stream, &client.client_first()).await;
+
+    let server_first = read_server_first(stream).await;
+    client.handle_server_first(&server_first);
+    write_message(stream, MSG_PASSWORD, client.client_final().as_bytes()).await;
+    assert_eq!(
+        read_server_final(stream).await,
+        client.expected_server_final()
+    );
+
+    read_post_auth_sequence(stream).await
 }
 
 /// Generate a fresh self-signed certificate and build a matching frontend TLS

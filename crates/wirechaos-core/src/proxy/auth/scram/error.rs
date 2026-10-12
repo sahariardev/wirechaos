@@ -57,9 +57,9 @@ impl std::fmt::Display for ScramError {
 pub fn map_proxy_error_auth_error(err: ProxyError) -> AuthFailure {
     match err {
         ProxyError::Internal(e) => AuthFailure::internal(e),
-        ProxyError::ConnectionError(_) => AuthFailure::Internal(Box::new(std::io::Error::new(
+        ProxyError::ConnectionError(e) => AuthFailure::Internal(Box::new(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "invalid data",
+            e.message().to_owned(),
         ))),
     }
 }

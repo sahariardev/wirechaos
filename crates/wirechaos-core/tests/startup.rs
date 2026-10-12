@@ -15,7 +15,6 @@ mod common;
 use common::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use wirechaos_core::proxy::conn::Conn;
 
 /// Server side of the happy path: accept, handle the SSLRequest (which replies
 /// 'S' and upgrades the socket to TLS), then read the real StartupMessage and
@@ -23,19 +22,13 @@ use wirechaos_core::proxy::conn::Conn;
 #[tokio::test]
 async fn ssl_request_promotes_connection_to_tls() {
     let (frontend_tls, connector) = tls_pair();
-    let pool = buffer_pool();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
 
     let server = tokio::spawn(async move {
         let (socket, _peer) = listener.accept().await.expect("accept");
-        let mut conn = Conn::new(
-            socket,
-            pool,
-            Some(frontend_tls),
-            TestVerifierProvider::new(),
-        );
+        let mut conn = test_conn(socket, Some(frontend_tls));
 
         // First call: read the SSLRequest, reply 'S', upgrade to TLS.
         conn.handle_startup()
@@ -103,15 +96,13 @@ async fn ssl_request_promotes_connection_to_tls() {
 /// and must leave the connection usable afterwards.
 #[tokio::test]
 async fn plaintext_startup_authenticates_and_stays_usable() {
-    let pool = buffer_pool();
-
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
 
     let server = tokio::spawn(async move {
         let (socket, _peer) = listener.accept().await.expect("accept");
         // No TLS acceptor configured: the connection must stay plaintext.
-        let mut conn = Conn::new(socket, pool, None, TestVerifierProvider::new());
+        let mut conn = test_conn(socket, None);
 
         conn.handle_startup()
             .await
@@ -182,14 +173,12 @@ async fn plaintext_startup_authenticates_and_stays_usable() {
 /// and the connection must stay usable in plaintext.
 #[tokio::test]
 async fn ssl_request_declined_without_tls_acceptor() {
-    let pool = buffer_pool();
-
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
 
     let server = tokio::spawn(async move {
         let (socket, _peer) = listener.accept().await.expect("accept");
-        let mut conn = Conn::new(socket, pool, None, TestVerifierProvider::new()); // TLS disabled
+        let mut conn = test_conn(socket, None); // TLS disabled
 
         // Server replied 'N'; the client proceeds in plaintext.
         conn.handle_startup()
@@ -230,14 +219,12 @@ async fn ssl_request_declined_without_tls_acceptor() {
 /// usable in plaintext — mirroring the SSL decline path.
 #[tokio::test]
 async fn gssenc_request_is_declined_and_connection_stays_plain() {
-    let pool = buffer_pool();
-
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
 
     let server = tokio::spawn(async move {
         let (socket, _peer) = listener.accept().await.expect("accept");
-        let mut conn = Conn::new(socket, pool, None, TestVerifierProvider::new());
+        let mut conn = test_conn(socket, None);
 
         conn.handle_startup()
             .await
@@ -278,14 +265,12 @@ async fn gssenc_request_is_declined_and_connection_stays_plain() {
 /// instead of being allowed to authenticate in the clear.
 #[tokio::test]
 async fn startup_is_rejected_when_tls_is_required() {
-    let pool = buffer_pool();
-
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
 
     let server = tokio::spawn(async move {
         let (socket, _peer) = listener.accept().await.expect("accept");
-        let mut conn = Conn::new(socket, pool, None, TestVerifierProvider::new());
+        let mut conn = test_conn(socket, None);
         conn.required_tls = true;
 
         conn.handle_startup()
@@ -311,19 +296,13 @@ async fn startup_is_rejected_when_tls_is_required() {
 #[tokio::test]
 async fn startup_over_tls_is_accepted_when_tls_is_required() {
     let (frontend_tls, connector) = tls_pair();
-    let pool = buffer_pool();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
 
     let server = tokio::spawn(async move {
         let (socket, _peer) = listener.accept().await.expect("accept");
-        let mut conn = Conn::new(
-            socket,
-            pool,
-            Some(frontend_tls),
-            TestVerifierProvider::new(),
-        );
+        let mut conn = test_conn(socket, Some(frontend_tls));
         conn.required_tls = true;
 
         // SSLRequest: reply 'S' and promote to TLS.
@@ -377,14 +356,12 @@ async fn startup_over_tls_is_accepted_when_tls_is_required() {
 /// the `ssl_done` guard trips and the connection is not promoted twice.
 #[tokio::test]
 async fn double_ssl_request_returns_error() {
-    let pool = buffer_pool();
-
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
 
     let server = tokio::spawn(async move {
         let (socket, _peer) = listener.accept().await.expect("accept");
-        let mut conn = Conn::new(socket, pool, None, TestVerifierProvider::new());
+        let mut conn = test_conn(socket, None);
 
         conn.handle_startup()
             .await
@@ -396,7 +373,7 @@ async fn double_ssl_request_returns_error() {
             .await
             .expect_err("second SSLRequest should error");
         assert!(
-            err.to_string().contains("already done"),
+            err.to_string().contains("already answered"),
             "unexpected error: {err}"
         );
     });
@@ -432,15 +409,12 @@ async fn double_ssl_request_returns_error() {
 /// error, mirroring the SSL guard.
 #[tokio::test]
 async fn double_gssenc_request_returns_error() {
-    let pool = buffer_pool();
-
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
 
     let server = tokio::spawn(async move {
         let (socket, _peer) = listener.accept().await.expect("accept");
-
-        let mut conn = Conn::new(socket, pool, None, TestVerifierProvider::new());
+        let mut conn = test_conn(socket, None);
 
         conn.handle_startup()
             .await
@@ -452,7 +426,7 @@ async fn double_gssenc_request_returns_error() {
             .await
             .expect_err("second GSSENCRequest should error");
         assert!(
-            err.to_string().contains("already done"),
+            err.to_string().contains("already answered"),
             "unexpected error: {err}"
         );
     });
@@ -488,21 +462,19 @@ async fn double_gssenc_request_returns_error() {
 /// rejected by `read_message_length`.
 #[tokio::test]
 async fn invalid_message_length_returns_error() {
-    let pool = buffer_pool();
-
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
 
     let server = tokio::spawn(async move {
         let (socket, _peer) = listener.accept().await.expect("accept");
-        let mut conn = Conn::new(socket, pool, None, TestVerifierProvider::new());
+        let mut conn = test_conn(socket, None);
 
         let err = conn
             .handle_startup()
             .await
             .expect_err("a length below 4 must be rejected");
         assert!(
-            err.to_string().contains("Invalid message length"),
+            err.to_string().contains("invalid message length"),
             "unexpected error: {err}"
         );
     });
@@ -515,33 +487,30 @@ async fn invalid_message_length_returns_error() {
     server.await.expect("server task completed cleanly");
 }
 
-/// A startup packet whose body exceeds MAX_STARTUP_PACKET_LENGTH (10000) must
-/// be rejected before its body is read.
+/// A startup packet whose total length exceeds the configured cap must be
+/// rejected before its body is read.
 #[tokio::test]
 async fn oversized_startup_packet_returns_error() {
-    let pool = buffer_pool();
-
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
 
     let server = tokio::spawn(async move {
         let (socket, _peer) = listener.accept().await.expect("accept");
-        let mut conn = Conn::new(socket, pool, None, TestVerifierProvider::new());
+        let mut conn = test_conn(socket, None);
 
         let err = conn
             .handle_startup()
             .await
             .expect_err("an oversized startup packet must be rejected");
         assert!(
-            err.to_string().contains("Invalid message length"),
+            err.to_string().contains("invalid startup packet layout"),
             "unexpected error: {err}"
         );
     });
 
     let mut tcp = TcpStream::connect(addr).await.expect("connect");
 
-    // MAX_STARTUP_PACKET_LENGTH is 10000; a total length of 10005 yields a
-    // body length of 10001, which exceeds it.
+    // The default cap is 10000 total bytes; 10005 exceeds it.
     write_length_prefix(&mut tcp, 10005).await;
 
     server.await.expect("server task completed cleanly");

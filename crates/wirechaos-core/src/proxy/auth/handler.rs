@@ -6,7 +6,6 @@ use crate::proxy::InternalError;
 use tracing::warn;
 
 const MSG_AUTH: u8 = b'R';
-const MSG_ERROR: u8 = b'E';
 
 impl<V: VerifierProvider> Conn<V> {
     pub async fn handle_authentication(&mut self) -> Result<Option<Vec<u8>>, ProxyError> {
@@ -48,10 +47,4 @@ impl<V: VerifierProvider> Conn<V> {
         self.send_error_message(err.code(), err.message()).await?;
         Ok(())
     }
-}
-
-//append value as c str (bytes + tailing nul)
-fn put_cstr(buf: &mut Vec<u8>, value: &str) {
-    buf.extend_from_slice(value.as_bytes());
-    buf.push(b'\0');
 }

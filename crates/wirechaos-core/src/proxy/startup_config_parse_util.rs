@@ -208,13 +208,13 @@ mod tests {
     fn parse_rejects_joined_dash_c_without_equals() {
         // A missing '=' must be an error, not a panic on the client's input.
         let err = parse_options("-ck".to_string()).unwrap_err();
-        assert_eq!(err.to_string(), "invalid data.");
+        assert_eq!(err.to_string(), "invalid data");
     }
 
     #[test]
     fn parse_rejects_double_dash_without_equals() {
         let err = parse_options("--connection-limit".to_string()).unwrap_err();
-        assert_eq!(err.to_string(), "invalid data.");
+        assert_eq!(err.to_string(), "invalid data");
     }
 
     #[test]
@@ -227,30 +227,30 @@ mod tests {
     #[test]
     fn parse_rejects_missing_value_after_dash_c() {
         let err = parse_options("-c".to_string()).unwrap_err();
-        assert_eq!(err.to_string(), "invalid data.");
+        assert_eq!(err.to_string(), "invalid data");
     }
 
     #[test]
     fn parse_rejects_empty_value() {
         let err = parse_options("-ck=".to_string()).unwrap_err();
-        assert_eq!(err.to_string(), "invalid data.");
+        assert_eq!(err.to_string(), "invalid data");
     }
 
     #[test]
     fn parse_rejects_empty_key() {
         let err = parse_options("-c=v".to_string()).unwrap_err();
-        assert_eq!(err.to_string(), "invalid data.");
+        assert_eq!(err.to_string(), "invalid data");
     }
 
     #[test]
     fn parse_rejects_double_dash_with_empty_value() {
         let err = parse_options("--foo=".to_string()).unwrap_err();
-        assert_eq!(err.to_string(), "invalid data.");
+        assert_eq!(err.to_string(), "invalid data");
     }
 
     #[test]
     fn parse_rejects_unsupported_option() {
         let err = parse_options("garbage".to_string()).unwrap_err();
-        assert_eq!(err.to_string(), "invalid data.");
+        assert_eq!(err.to_string(), "invalid data");
     }
 }

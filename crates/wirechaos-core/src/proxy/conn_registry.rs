@@ -1,6 +1,7 @@
 use std::sync::{Arc, PoisonError, RwLock};
 
-pub const MAX_CONCURRENT_CONNECCTION: u32 = 100;
+/// Default connection cap, matching PostgreSQL's `max_connections` default.
+pub const DEFAULT_MAX_CONNECTIONS: u32 = 100;
 
 pub struct ConnRegistry {
     inner: Arc<RwLock<Inner>>,
@@ -82,10 +83,26 @@ mod tests {
         let registry = ConnRegistry::new(1);
         let clone = registry.clone();
 
-        let _ = registry.try_acquire();
+        let _permit = registry.try_acquire().expect("first slot");
         assert!(
             clone.try_acquire().is_none(),
             "clones must share the same count"
         );
+    }
+
+    #[test]
+    fn a_slot_is_released_even_if_the_holder_panics() {
+        let registry = ConnRegistry::new(1);
+
+        let result = std::panic::catch_unwind({
+            let registry = registry.clone();
+            move || {
+                let _permit = registry.try_acquire().expect("slot");
+                panic!("session task panics while holding the permit");
+            }
+        });
+
+        assert!(result.is_err(), "the panicking closure must unwind");
+        assert_eq!(registry.live(), 0, "an abrupt exit must not leak a slot");
     }
 }

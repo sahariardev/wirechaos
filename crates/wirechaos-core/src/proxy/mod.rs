@@ -3,6 +3,7 @@ pub type InternalError = Box<dyn std::error::Error + Send + Sync>;
 pub mod auth;
 pub mod backend;
 pub mod buffer_pool;
+pub mod config;
 pub mod conn;
 mod conn_read;
 pub mod conn_registry;

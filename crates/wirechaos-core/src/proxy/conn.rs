@@ -1,19 +1,22 @@
 use crate::proxy::auth::verifier::VerifierProvider;
 use crate::proxy::backend::connection::Backend;
 use crate::proxy::backend::registry::Registry;
+use crate::proxy::backend::registry::SessionGuard;
 use crate::proxy::backend::session_key_secret::SessionKeySecret;
 use crate::proxy::buffer_pool::{MultiBufferPool, PooledBytes};
+use crate::proxy::config::Config;
 use crate::proxy::conn_read::ConnRead;
 use crate::proxy::conn_registry::ConnRegistry;
 use crate::proxy::conn_write::ConnWrite;
-use crate::proxy::error::{connection_error, ConnectionErrorInner::*, ProxyError};
+use crate::proxy::error::{
+    connection_error, protocol_error, ClientAwareError, ConnectionErrorInner::*, ProxyError,
+};
 use crate::proxy::packet::MessageReader;
 use crate::proxy::replication_mode::ReplicationMode;
 use crate::proxy::startup_config_parse_util::{parse_options, parse_replication_mode};
 use crate::proxy::tls::FrontendTls;
 use crate::proxy::InternalError;
 use std::collections::HashMap;
-use std::io;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpStream;
@@ -38,9 +41,12 @@ pub struct Conn<V: VerifierProvider> {
     pub session_key_secret: Option<SessionKeySecret>,
     pub backend: Option<Arc<Backend>>,
     pub conn_registry: ConnRegistry,
+    pub config: Arc<Config>,
+    /// Kept alive for the session's lifetime so the registry entry — and with it
+    /// the cancel key — exists exactly as long as the session does.
+    session_guard: Option<SessionGuard>,
 }
 
-const MAX_STARTUP_PACKET_LENGTH: u32 = 10000;
 const CANCEL_REQUEST_CODE: u32 = (1234 << 16) | 5678;
 const SSL_REQUEST_CODE: u32 = (1234 << 16) | 5679;
 const GSSENC_REQUEST_CODE: u32 = (1234 << 16) | 5680;
@@ -54,8 +60,20 @@ const MSG_PARAMETER_STATUS: u8 = b'S';
 const MSG_KEY_SECRET: u8 = b'K';
 const MSG_READY_ACCEPT_QUERY: u8 = b'Z';
 const MSG_ERROR: u8 = b'E';
+const SQLSTATE_FEATURE_NOT_SUPPORTED: &str = "0A000";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupOutCome {
+    Continued,
+    Ready,
+    Close,
+}
 
 impl<V: VerifierProvider> Conn<V> {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each argument transfers ownership of one per-session component; a builder would obscure the ownership transfer without adding safety"
+    )]
     pub fn new(
         conn_id: i32,
         stream: TcpStream,
@@ -64,6 +82,7 @@ impl<V: VerifierProvider> Conn<V> {
         verifier_provider: V,
         backend_pool: Registry,
         conn_registry: ConnRegistry,
+        config: Arc<Config>,
     ) -> Self {
         let (read_half, write_half) = stream.into_split();
         Self {
@@ -86,6 +105,8 @@ impl<V: VerifierProvider> Conn<V> {
             session_key_secret: None,
             backend: None,
             conn_registry,
+            config,
+            session_guard: None,
         }
     }
 
@@ -96,53 +117,87 @@ impl<V: VerifierProvider> Conn<V> {
     /// known gap is visible rather than hidden.
     pub async fn handle(&mut self) -> Result<(), InternalError> {
         let Some(_permit) = self.conn_registry.try_acquire() else {
-            self.send_error_message("53300", "sorry, too many connection")
+            self.send_error_message(TooManyRequest.code(), TooManyRequest.message())
                 .await?;
             return Ok(());
         };
 
-        match self.handle_startup().await {
-            Ok(()) => {}
-            Err(ProxyError::Internal(err)) => return Err(err),
-            Err(ProxyError::ConnectionError(err)) => {
-                self.send_error_message(err.code(), err.message()).await?;
+        let deadline = self.config.authentication_timeout();
+
+        match tokio::time::timeout(deadline, self.drive_startup_until_ready()).await {
+            Ok(result) => result?,
+            Err(_ellapsed) => {
+                self.send_error_message(AuthTimeout.code(), AuthTimeout.message())
+                    .await?;
+
+                return Ok(());
             }
-        };
+        }
+
+        //todo::relay
+        Ok(())
+    }
+
+    async fn drive_startup_until_ready(&mut self) -> Result<(), InternalError> {
+        loop {
+            match self.handle_startup().await {
+                Ok(StartupOutCome::Continued) => {
+                    continue;
+                }
+                Ok(StartupOutCome::Ready) => {
+                    break;
+                }
+                Ok(StartupOutCome::Close) => {
+                    return Ok(());
+                }
+                Err(ProxyError::Internal(err)) => return Err(err),
+                Err(ProxyError::ConnectionError(err)) => {
+                    // The handler did not write anything; the driver owns the
+                    // single ErrorResponse for a startup failure, then closes.
+                    self.send_error_message(err.code(), err.message()).await?;
+                    return Ok(());
+                }
+            };
+        }
 
         Ok(())
     }
 
-    pub async fn handle_startup(&mut self) -> Result<(), ProxyError> {
+    pub async fn handle_startup(&mut self) -> Result<StartupOutCome, ProxyError> {
         let buf = self.read_startup_packet().await?;
         let mut message_reader = MessageReader::new(buf);
         let protocol_code = message_reader.read_u32()?;
+
         match protocol_code {
             SSL_REQUEST_CODE => {
                 self.handle_ssl_request().await?;
+                Ok(StartupOutCome::Continued)
             }
             GSSENC_REQUEST_CODE => {
                 self.handle_gssnc_request().await?;
+                Ok(StartupOutCome::Continued)
             }
             CANCEL_REQUEST_CODE => {
                 self.handle_cancel_request(&mut message_reader)?;
+                // A cancel connection is a dead end: no auth, no response.
+                Ok(StartupOutCome::Close)
             }
-
             PROTOCOL_VERSION_NUMBER => {
                 if self.required_tls && !self.ssl_done {
                     return Err(connection_error(TlsRequired));
                 }
 
                 self.handle_startup_packet(protocol_code, &mut message_reader)
-                    .await?;
-                //here the loop will contnue
+                    .await
             }
-            invalid_version => {
-                self.handle_protocol_version_mismatch(invalid_version)
-                    .await?;
-            }
+            // Any code that is not a magic request code is a StartupMessage
+            // carrying a protocol version. Phase 1 speaks 3.0 only and rejects
+            // everything else with PostgreSQL's exact wording (§3.2).
+            invalid_version => Err(protocol_error(
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                unsupported_protocol_message(invalid_version),
+            )),
         }
-
-        Ok(())
     }
 
     pub async fn send_error_message(
@@ -159,18 +214,24 @@ impl<V: VerifierProvider> Conn<V> {
         &mut self,
         protocol_version: u32,
         message_reader: &mut MessageReader,
-    ) -> Result<(), ProxyError> {
+    ) -> Result<StartupOutCome, ProxyError> {
         self.protocol_version = Some(protocol_version);
 
+        let mut saw_terminator = false;
         while message_reader.remaining() > 0 {
             let key = message_reader.read_string()?;
 
             if key.is_empty() {
+                saw_terminator = true;
                 break;
             }
 
             let value = message_reader.read_string()?;
             self.params.insert(key, value);
+        }
+
+        if !saw_terminator || message_reader.remaining() != 0 {
+            return Err(connection_error(InvalidStartupLayout));
         }
 
         let option = self.params.get("options");
@@ -182,16 +243,21 @@ impl<V: VerifierProvider> Conn<V> {
             self.params.remove("options");
         }
 
-        if let Some(value) = self.params.get("user") {
-            self.user = Some(value.to_string());
-            self.database = Some(value.to_string());
-        }
+        let user = self
+            .params
+            .get("user")
+            .map(|s| s.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| connection_error(MissingUser))?;
 
-        if let Some(value) = self.params.get("database") {
-            if !value.is_empty() {
-                self.database = Some(value.to_string());
-            }
-        }
+        self.user = Some(user.to_owned());
+        self.database = Some(
+            self.params
+                .get("database")
+                .filter(|d| !d.is_empty())
+                .cloned()
+                .unwrap_or_else(|| user.to_owned()),
+        );
 
         if let Some(value) = self.params.get("replication") {
             let replication_mode = parse_replication_mode(value.to_string())?;
@@ -201,30 +267,41 @@ impl<V: VerifierProvider> Conn<V> {
         let client_key = self.handle_authentication().await?;
 
         if client_key.is_none() {
-            // Rejected: the client has already been told why, so this is not a
-            // fault to report — it is the end of the startup phase. Returning
-            // here keeps `handle` (the relay) from ever seeing a connection
-            // whose client never authenticated.
-            //
-            // todo:: close the socket explicitly, and let the session driver
-            // distinguish "rejected" from "faulted" once it exist
-            return Err(connection_error(AuthFailed));
+            // Rejected: `handle_authentication` already wrote the
+            // ErrorResponse, so the driver must not send a second one. Close.
+            return Ok(StartupOutCome::Close);
         }
 
-        //todo:: using dummy backend now, in future we will add a proper backend
-        let session_key_secret = SessionKeySecret::new();
+        // todo:: the stub backend is replaced by the real link.
         let backend = Arc::new(Backend::default());
 
-        self.backend = Some(Arc::clone(&backend));
+        let mut registered = None;
+        for _ in 0..64 {
+            let candidate = SessionKeySecret::new();
+            match self
+                .backend_registry
+                .register(Arc::clone(&backend), self.conn_id, candidate)
+            {
+                Ok(guard) => {
+                    registered = Some((candidate, guard));
+                    break;
+                }
+                Err(_) => continue,
+            }
+        }
+
+        let (session_key_secret, guard) =
+            registered.ok_or_else(|| connection_error(InvalidState))?;
+
+        self.backend = Some(backend);
         self.session_key_secret = Some(session_key_secret);
-        self.backend_registry
-            .register(backend, self.conn_id, session_key_secret);
+        self.session_guard = Some(guard);
 
         self.send_parameter_status().await?;
         self.send_key_secret().await?;
         self.send_ready_signal().await?;
 
-        Ok(())
+        Ok(StartupOutCome::Ready)
     }
 
     /// Route a `CancelRequest` to the session it names.
@@ -234,7 +311,7 @@ impl<V: VerifierProvider> Conn<V> {
         &mut self,
         message_reader: &mut MessageReader,
     ) -> Result<(), ProxyError> {
-        if message_reader.remaining() < 8 {
+        if message_reader.remaining() != 8 {
             return Err(connection_error(InvalidMessageLength));
         }
 
@@ -249,7 +326,7 @@ impl<V: VerifierProvider> Conn<V> {
             }
             None => tracing::debug!(
                 session_pid = pid,
-                "cancel request for an unknow or stale session; ignoring"
+                "cancel request for an unknown or stale session; ignoring"
             ),
         }
 
@@ -363,7 +440,7 @@ impl<V: VerifierProvider> Conn<V> {
     pub async fn read_startup_packet(&mut self) -> Result<PooledBytes, ProxyError> {
         let length = self.read_message_length().await?;
 
-        if length > MAX_STARTUP_PACKET_LENGTH as usize {
+        if length + 4 > self.config.max_startup_bytes() {
             return Err(connection_error(FirstMessageTooBig));
         }
 
@@ -382,7 +459,7 @@ impl<V: VerifierProvider> Conn<V> {
         }
 
         if length > self.pool.max_capacity() {
-            return Err(connection_error(InvalidMessageLength));
+            return Err(connection_error(MessageTooLarge));
         }
 
         let pool = self.pool.clone();
@@ -427,11 +504,9 @@ impl<V: VerifierProvider> Conn<V> {
             }
         };
 
-        if backend.get_param_status_values().is_empty() {
-            return Ok(());
-        }
+        let parameters = backend.get_param_status_values();
 
-        for (name, value) in backend.get_param_status_values() {
+        for (name, value) in parameters {
             let mut buf = Vec::new();
             put_cstr(&mut buf, &name);
             put_cstr(&mut buf, &value);
@@ -469,29 +544,16 @@ impl<V: VerifierProvider> Conn<V> {
             .map_err(ProxyError::internal)?;
         Ok(())
     }
+}
 
-    async fn handle_protocol_version_mismatch(&mut self, version: u32) -> Result<(), ProxyError> {
-        let (major, minor) = (version >> 16, version & 0xffff);
-        let message =
-            format!("Invalid version {major}:{minor}. Supported version is from 3.0 to 3.0");
-
-        let mut response = Vec::new();
-        for (field, value) in [(b'S', "FATAL"), (b'C', "0A00"), (b'M', message.as_str())] {
-            response.push(field);
-            response.extend_from_slice(value.as_bytes());
-            response.push(b'\0');
-        }
-        response.push(b'\0');
-
-        self.write_message(b'E', &response)
-            .await
-            .map_err(ProxyError::internal)?;
-
-        Err(ProxyError::Internal(Box::new(io::Error::new(
-            io::ErrorKind::InvalidData,
-            message,
-        ))))
-    }
+/// PostgreSQL's message for a frontend protocol version we do not speak.
+///
+/// The wording is load-bearing: clients and the acceptance suite grep for it,
+/// so the `major.minor` spelling and punctuation must match (§3.2, §4.3).
+#[must_use]
+fn unsupported_protocol_message(version: u32) -> String {
+    let (major, minor) = (version >> 16, version & 0xffff);
+    format!("unsupported frontend protocol {major}.{minor}: server supports 3.0 to 3.0")
 }
 
 fn put_cstr(buf: &mut Vec<u8>, value: &str) {
@@ -512,4 +574,31 @@ fn prepare_error_buf(severity: &str, code: &str, message: &str) -> Vec<u8> {
     put_cstr(&mut body, message);
     body.push(b'\0');
     body
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protocol_version_message_matches_postgres() {
+        assert_eq!(
+            unsupported_protocol_message(4 << 16),
+            "unsupported frontend protocol 4.0: server supports 3.0 to 3.0"
+        );
+        assert_eq!(
+            unsupported_protocol_message((3 << 16) | 2),
+            "unsupported frontend protocol 3.2: server supports 3.0 to 3.0"
+        );
+    }
+
+    #[test]
+    fn error_body_carries_severity_code_and_message_fields() {
+        let body = prepare_error_buf("FATAL", "53300", "sorry, too many clients already");
+
+        assert_eq!(body.first(), Some(&b'S'));
+        assert_eq!(body.last(), Some(&0));
+        assert_eq!(body.iter().filter(|&&byte| byte == b'C').count(), 1);
+        assert_eq!(body.iter().filter(|&&byte| byte == b'M').count(), 1);
+    }
 }

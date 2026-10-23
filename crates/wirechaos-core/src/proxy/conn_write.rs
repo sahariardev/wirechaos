@@ -11,6 +11,7 @@ pub enum ConnWrite {
     Empty,
     Plain(OwnedWriteHalf),
     Tls(WriteHalf<TlsStream<TcpStream>>),
+    ClientTls(WriteHalf<tokio_rustls::client::TlsStream<TcpStream>>),
 }
 
 impl AsyncWrite for ConnWrite {
@@ -22,6 +23,7 @@ impl AsyncWrite for ConnWrite {
         match self.get_mut() {
             ConnWrite::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
             ConnWrite::Tls(stream) => Pin::new(stream).poll_write(cx, buf),
+            ConnWrite::ClientTls(stream) => Pin::new(stream).poll_write(cx, buf),
             ConnWrite::Empty => Poll::Ready(Ok(0)),
         }
     }
@@ -30,6 +32,7 @@ impl AsyncWrite for ConnWrite {
         match self.get_mut() {
             ConnWrite::Plain(stream) => Pin::new(stream).poll_flush(cx),
             ConnWrite::Tls(stream) => Pin::new(stream).poll_flush(cx),
+            ConnWrite::ClientTls(stream) => Pin::new(stream).poll_flush(cx),
             ConnWrite::Empty => Poll::Ready(Ok(())),
         }
     }
@@ -38,6 +41,7 @@ impl AsyncWrite for ConnWrite {
         match self.get_mut() {
             ConnWrite::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
             ConnWrite::Tls(stream) => Pin::new(stream).poll_shutdown(cx),
+            ConnWrite::ClientTls(stream) => Pin::new(stream).poll_shutdown(cx),
             ConnWrite::Empty => Poll::Ready(Ok(())),
         }
     }

@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
-use crate::proxy::backend::{connection::Backend, session_key_secret::SessionKeySecret};
+use crate::proxy::backend::{client::Backend, session_key_secret::SessionKeySecret};
 
 #[derive(Default)]
 struct Inner {

@@ -32,6 +32,7 @@ zeroize = { version = "1.8", features = ["derive"] }
 arc-swap = "1.7"
 tokio-postgres = { workspace = true, optional = true }
 stringprep = "0.1"
+webpki-roots = "0.26"
 
 [features]
 # The pgbouncer-style `auth_query` source pulls in a SQL driver. It is off by

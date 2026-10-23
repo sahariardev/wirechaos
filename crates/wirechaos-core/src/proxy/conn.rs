@@ -1,5 +1,5 @@
 use crate::proxy::auth::verifier::VerifierProvider;
-use crate::proxy::backend::connection::Backend;
+use crate::proxy::backend::client::Backend;
 use crate::proxy::backend::registry::Registry;
 use crate::proxy::backend::registry::SessionGuard;
 use crate::proxy::backend::session_key_secret::SessionKeySecret;
@@ -47,14 +47,14 @@ pub struct Conn<V: VerifierProvider> {
     session_guard: Option<SessionGuard>,
 }
 
-const CANCEL_REQUEST_CODE: u32 = (1234 << 16) | 5678;
-const SSL_REQUEST_CODE: u32 = (1234 << 16) | 5679;
-const GSSENC_REQUEST_CODE: u32 = (1234 << 16) | 5680;
+pub const CANCEL_REQUEST_CODE: u32 = (1234 << 16) | 5678;
+pub const SSL_REQUEST_CODE: u32 = (1234 << 16) | 5679;
+pub const GSSENC_REQUEST_CODE: u32 = (1234 << 16) | 5680;
 
 //protocol version
 const PROTOCOL_MAJOR_VERSION: u32 = 3;
 const PROTOCOL_MINOR_VERSION: u32 = 0;
-const PROTOCOL_VERSION_NUMBER: u32 = (PROTOCOL_MAJOR_VERSION << 16) | PROTOCOL_MINOR_VERSION;
+pub const PROTOCOL_VERSION_NUMBER: u32 = (PROTOCOL_MAJOR_VERSION << 16) | PROTOCOL_MINOR_VERSION;
 
 const MSG_PARAMETER_STATUS: u8 = b'S';
 const MSG_KEY_SECRET: u8 = b'K';

@@ -1,8 +1,8 @@
 use crate::proxy::auth::verifier::VerifierProvider;
-use crate::proxy::backend::client::Backend;
 use crate::proxy::backend::registry::Registry;
 use crate::proxy::backend::registry::SessionGuard;
 use crate::proxy::backend::session_key_secret::SessionKeySecret;
+use crate::proxy::backend::{Backend, PgConfig};
 use crate::proxy::buffer_pool::{MultiBufferPool, PooledBytes};
 use crate::proxy::config::Config;
 use crate::proxy::conn_read::ConnRead;
@@ -266,14 +266,50 @@ impl<V: VerifierProvider> Conn<V> {
 
         let client_key = self.handle_authentication().await?;
 
-        if client_key.is_none() {
+        let Some(client_key) = client_key else {
             // Rejected: `handle_authentication` already wrote the
             // ErrorResponse, so the driver must not send a second one. Close.
             return Ok(StartupOutCome::Close);
-        }
+        };
 
-        // todo:: the stub backend is replaced by the real link.
-        let backend = Arc::new(Backend::default());
+        let user = self
+            .user
+            .clone()
+            .ok_or_else(|| connection_error(InvalidState))?;
+        let database = self
+            .database
+            .clone()
+            .ok_or_else(|| connection_error(InvalidState))?;
+
+        // The verifier that authenticated the client is also the one the
+        // backend link must use; `ClientKey` is bound to its salt/iterations.
+        let verifier = self
+            .provider
+            .lookup(&user)
+            .await
+            .map_err(ProxyError::internal)?
+            .ok_or_else(|| connection_error(InvalidState))?;
+
+        let (host, port) = self
+            .config
+            .backend_host_port()
+            .map_err(ProxyError::internal)?;
+
+        let pg_config = PgConfig::new(
+            client_key,
+            verifier.server_key().to_vec(),
+            verifier.stored_key().to_vec(),
+            user,
+            database,
+            std::time::Duration::from_millis(self.config.backend.connect_timeout_ms),
+            host,
+            port,
+            self.config.backend.tls_domain.clone(),
+            verifier.salt().to_vec(),
+            verifier.iterations(),
+        );
+
+        let backend = Backend::new(pg_config, Arc::clone(&self.pool)).await?;
 
         let mut registered = None;
         for _ in 0..64 {

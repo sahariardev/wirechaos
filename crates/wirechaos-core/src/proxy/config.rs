@@ -18,6 +18,41 @@ pub struct Config {
     pub limits: LimitsConfig,
     #[serde(default)]
     pub credentials: CredentialsConfig,
+    #[serde(default)]
+    pub backend: BackendConfig,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BackendConfig {
+    /// `host:port` of the PostgreSQL backend.
+    #[serde(default = "default_backend_address")]
+    pub address: String,
+
+    #[serde(default = "default_backend_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+
+    /// When set, the proxy attempts TLS and verifies the certificate against
+    /// the system roots. `None` keeps the backend link plaintext.
+    #[serde(default)]
+    pub tls_domain: Option<String>,
+}
+
+impl Default for BackendConfig {
+    fn default() -> Self {
+        Self {
+            address: default_backend_address(),
+            connect_timeout_ms: default_backend_connect_timeout_ms(),
+            tls_domain: None,
+        }
+    }
+}
+
+fn default_backend_address() -> String {
+    "127.0.0.1:5432".to_owned()
+}
+
+fn default_backend_connect_timeout_ms() -> u64 {
+    2_000
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,6 +138,25 @@ impl Config {
 
     pub fn max_startup_bytes(&self) -> usize {
         self.limits.max_startup_bytes
+    }
+
+    pub fn backend_host_port(&self) -> Result<(String, u16), ConfigError> {
+        let (host, port) = self.backend.address.rsplit_once(':').ok_or_else(|| {
+            ConfigError::single("backend.address", "must be a host:port socket address")
+        })?;
+
+        if host.is_empty() {
+            return Err(ConfigError::single(
+                "backend.address",
+                "must be a host:port socket address",
+            ));
+        }
+
+        let port = port.parse::<u16>().map_err(|_| {
+            ConfigError::single("backend.address", "must be a host:port socket address")
+        })?;
+
+        Ok((host.to_owned(), port))
     }
 
     pub async fn build_credential_store(&self) -> Result<CredentialStore, ConfigError> {

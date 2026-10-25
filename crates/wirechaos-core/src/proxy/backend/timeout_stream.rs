@@ -26,7 +26,7 @@ impl TimeoutStream {
     pub async fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), PgError> {
         tokio::time::timeout(self.timeout, self.buffer_reader.read_exact(buf))
             .await
-            .map_err(|_| PgError::Timeout)??;
+            .map_err(|_| PgError::StartupTimeout)??;
 
         Ok(())
     }
@@ -34,7 +34,7 @@ impl TimeoutStream {
     pub async fn write_all(&mut self, buf: &[u8]) -> Result<(), PgError> {
         tokio::time::timeout(self.timeout, self.buffer_writer.write_all(buf))
             .await
-            .map_err(|_| PgError::Timeout)??;
+            .map_err(|_| PgError::StartupTimeout)??;
 
         Ok(())
     }
@@ -42,7 +42,7 @@ impl TimeoutStream {
     pub async fn flush(&mut self) -> Result<(), PgError> {
         tokio::time::timeout(self.timeout, self.buffer_writer.flush())
             .await
-            .map_err(|_| PgError::Timeout)??;
+            .map_err(|_| PgError::StartupTimeout)??;
         Ok(())
     }
 }

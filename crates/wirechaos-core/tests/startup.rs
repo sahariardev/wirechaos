@@ -15,6 +15,7 @@ mod common;
 use common::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use wirechaos_core::proxy::config::Config;
 
 /// Server side of the happy path: accept, handle the SSLRequest (which replies
 /// 'S' and upgrades the socket to TLS), then read the real StartupMessage and
@@ -96,13 +97,14 @@ async fn ssl_request_promotes_connection_to_tls() {
 /// and must leave the connection usable afterwards.
 #[tokio::test]
 async fn plaintext_startup_authenticates_and_stays_usable() {
+    let (config, _backend) = config_pointed_at_new_backend(Config::default()).await;
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
 
     let server = tokio::spawn(async move {
         let (socket, _peer) = listener.accept().await.expect("accept");
         // No TLS acceptor configured: the connection must stay plaintext.
-        let mut conn = test_conn(socket, None);
+        let mut conn = test_conn_with_config(socket, None, config);
 
         conn.handle_startup()
             .await
@@ -296,13 +298,14 @@ async fn startup_is_rejected_when_tls_is_required() {
 #[tokio::test]
 async fn startup_over_tls_is_accepted_when_tls_is_required() {
     let (frontend_tls, connector) = tls_pair();
+    let (config, _backend) = config_pointed_at_new_backend(Config::default()).await;
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
 
     let server = tokio::spawn(async move {
         let (socket, _peer) = listener.accept().await.expect("accept");
-        let mut conn = test_conn(socket, Some(frontend_tls));
+        let mut conn = test_conn_with_config(socket, Some(frontend_tls), config);
         conn.required_tls = true;
 
         // SSLRequest: reply 'S' and promote to TLS.

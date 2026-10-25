@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
-use crate::proxy::backend::{session_key_secret::SessionKeySecret, Backend};
+use crate::proxy::backend::{session_key_secret::SessionKeySecret, Backend, BackendKeyData};
 
 #[derive(Default)]
 struct Inner {
@@ -57,6 +57,15 @@ impl Registry {
 
     pub fn lookup_by_key(&self, key: SessionKeySecret) -> Option<Arc<Backend>> {
         self.lock().key_secret_backend.get(&key).cloned()
+    }
+
+    /// The backend's real cancel key for a proxy-minted key.
+    ///
+    /// This is the task-9 handoff point: the key must never be sent to the
+    /// client, only used to open a `CancelRequest` connection to the backend.
+    pub fn lookup_backend_key(&self, key: SessionKeySecret) -> Option<BackendKeyData> {
+        self.lookup_by_key(key)
+            .and_then(|backend| backend.backend_key())
     }
 }
 

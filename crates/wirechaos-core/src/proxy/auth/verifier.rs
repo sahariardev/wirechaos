@@ -68,6 +68,10 @@ pub struct Verifier {
     salt: Vec<u8>,
     stored_key: [u8; 32],
     server_key: [u8; 32],
+    /// Present only for a `password:` entry. It is what allows the proxy to
+    /// answer a backend challenge that cannot be derived from StoredKey (MD5 or
+    /// cleartext); a `scram_secret:` entry never carries it.
+    password: Option<Vec<u8>>,
     #[zeroize(skip)]
     dummy: bool,
 }
@@ -97,6 +101,7 @@ impl Verifier {
             salt: salt.to_vec(),
             stored_key: sha256(&client_key),
             server_key,
+            password: Some(password.to_vec()),
             dummy: false,
         };
 
@@ -122,6 +127,15 @@ impl Verifier {
         &self.server_key
     }
 
+    /// The plaintext password, when this verifier came from a `password:` entry.
+    ///
+    /// A SCRAM secret deliberately has no way to recover it. The backend link
+    /// uses this only to answer a cleartext/MD5 challenge or to derive keys for
+    /// a backend salt that differs from ours.
+    pub fn password(&self) -> Option<&[u8]> {
+        self.password.as_deref()
+    }
+
     pub fn is_dummy(&self) -> bool {
         self.dummy
     }
@@ -137,6 +151,7 @@ impl Verifier {
             salt: digest[..16].to_vec(),
             stored_key: [0u8; 32],
             server_key: [0u8; 32],
+            password: None,
             dummy: true,
         }
     }
@@ -180,6 +195,7 @@ impl Verifier {
             salt: salt.to_vec(),
             stored_key,
             server_key,
+            password: None,
             dummy: false,
         })
     }

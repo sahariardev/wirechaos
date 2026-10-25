@@ -11,6 +11,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![allow(dead_code)] // each test crate uses a different subset of these helpers
 
+pub mod fake_backend;
+
 use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
@@ -18,7 +20,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use rustls::{Certificate, PrivateKey, RootCertStore, ServerConfig, ServerName};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+use rustls::{RootCertStore, ServerConfig};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
@@ -75,6 +78,62 @@ pub fn buffer_pool() -> Arc<MultiBufferPool> {
 /// The default configuration, wrapped for sharing with a [`Conn`].
 pub fn test_config() -> Arc<Config> {
     Arc::new(Config::default())
+}
+
+/// A configuration whose backend link points at `backend`, with TLS disabled so
+/// the fake backend does not need an `SSLRequest` dance.
+pub fn config_for_backend(backend: SocketAddr) -> Arc<Config> {
+    let mut config = Config::default();
+    config.backend.address = backend.to_string();
+    config.backend.tls.mode = wirechaos_core::proxy::config::BackendTlsMode::Disable;
+    Arc::new(config)
+}
+
+/// As [`config_for_backend`], with explicit startup deadlines.
+pub fn config_for_backend_with_timeouts(
+    backend: SocketAddr,
+    connect_timeout_ms: u64,
+    startup_timeout_ms: u64,
+) -> Arc<Config> {
+    let mut config = Config::default();
+    config.backend.address = backend.to_string();
+    config.backend.tls.mode = wirechaos_core::proxy::config::BackendTlsMode::Disable;
+    config.backend.connect_timeout_ms = connect_timeout_ms;
+    config.backend.startup_timeout_ms = startup_timeout_ms;
+    Arc::new(config)
+}
+
+/// Spawn a trust-auth fake backend and point `config` at it.
+pub async fn config_pointed_at_new_backend(mut config: Config) -> (Arc<Config>, FakeBackendHandle) {
+    let backend = fake_backend::FakeBackend::start()
+        .with_trust_auth()
+        .start()
+        .await;
+    config.backend.address = backend.addr().to_string();
+    config.backend.tls.mode = wirechaos_core::proxy::config::BackendTlsMode::Disable;
+    (Arc::new(config), backend)
+}
+
+/// Type alias so tests can name the returned fake backend without importing the
+/// submodule directly.
+pub type FakeBackendHandle = fake_backend::FakeBackend;
+
+/// A [`Conn`] over an explicit configuration.
+pub fn test_conn_with_config(
+    socket: TcpStream,
+    frontend_tls: Option<FrontendTls>,
+    config: Arc<Config>,
+) -> Conn<TestVerifierProvider> {
+    Conn::new(
+        0,
+        socket,
+        buffer_pool(),
+        frontend_tls,
+        TestVerifierProvider::new(),
+        Registry::new(),
+        ConnRegistry::new(100),
+        config,
+    )
 }
 
 /// A [`Conn`] backed by the in-memory test provider and a fresh registry.
@@ -139,6 +198,57 @@ pub async fn spawn_startup_server(
     conn_registry: ConnRegistry,
     config: Arc<Config>,
 ) -> SocketAddr {
+    let backend = fake_backend::FakeBackend::start()
+        .with_trust_auth()
+        .start()
+        .await;
+
+    let mut owned = (*config).clone();
+    owned.backend.address = backend.addr().to_string();
+    owned.backend.tls.mode = wirechaos_core::proxy::config::BackendTlsMode::Disable;
+    let config = Arc::new(owned);
+
+    spawn_startup_server_with_config(registry, conn_registry, config).await
+}
+
+/// Accept one connection and drive [`Conn::handle`] with an explicit config.
+pub async fn spawn_startup_server_with_config(
+    registry: Registry,
+    conn_registry: ConnRegistry,
+    config: Arc<Config>,
+) -> SocketAddr {
+    spawn_proxy_with_provider(TestVerifierProvider::new(), registry, conn_registry, config).await
+}
+
+/// Accept one connection and drive [`Conn::handle`] with an arbitrary verifier
+/// provider, so the credential-store integration tests exercise the real store.
+pub async fn spawn_proxy_with_provider<V: VerifierProvider>(
+    provider: V,
+    registry: Registry,
+    conn_registry: ConnRegistry,
+    config: Arc<Config>,
+) -> SocketAddr {
+    spawn_proxy_with_provider_inner(provider, registry, conn_registry, config, false).await
+}
+
+/// As [`spawn_proxy_with_provider`], but keeps the accepted session alive after
+/// startup so registry assertions can observe the task-6 handoff state.
+pub async fn spawn_proxy_with_provider_holding<V: VerifierProvider>(
+    provider: V,
+    registry: Registry,
+    conn_registry: ConnRegistry,
+    config: Arc<Config>,
+) -> SocketAddr {
+    spawn_proxy_with_provider_inner(provider, registry, conn_registry, config, true).await
+}
+
+async fn spawn_proxy_with_provider_inner<V: VerifierProvider>(
+    provider: V,
+    registry: Registry,
+    conn_registry: ConnRegistry,
+    config: Arc<Config>,
+    hold_after_startup: bool,
+) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
 
@@ -149,13 +259,20 @@ pub async fn spawn_startup_server(
             socket,
             buffer_pool(),
             None,
-            TestVerifierProvider::new(),
+            provider,
             registry,
             conn_registry,
             config,
         );
 
         let _ = conn.handle().await;
+
+        if hold_after_startup {
+            // The startup driver returns after `ReadyForQuery`; the real
+            // session would now enter the relay (task 6) and keep its registry
+            // guard alive. Hold it so tests can observe that handoff.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
     });
 
     addr
@@ -248,11 +365,10 @@ pub fn tls_pair() -> (FrontendTls, TlsConnector) {
     let key_der = certified_key.key_pair.serialize_der();
 
     let server_config = ServerConfig::builder()
-        .with_safe_defaults()
         .with_no_client_auth()
         .with_single_cert(
-            vec![Certificate(cert_der.as_ref().to_vec())],
-            PrivateKey(key_der),
+            vec![cert_der.clone()],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der)),
         )
         .expect("build server config");
 
@@ -260,11 +376,10 @@ pub fn tls_pair() -> (FrontendTls, TlsConnector) {
 
     let mut roots = RootCertStore::empty();
     roots
-        .add(&Certificate(cert_der.as_ref().to_vec()))
+        .add(CertificateDer::from(cert_der.as_ref().to_vec()))
         .expect("add self-signed cert as root");
 
     let client_config = rustls::ClientConfig::builder()
-        .with_safe_defaults()
         .with_root_certificates(roots)
         .with_no_client_auth();
 
@@ -281,7 +396,7 @@ pub fn tls_pair() -> (FrontendTls, TlsConnector) {
 }
 
 /// The name the client uses to verify the test server's certificate.
-pub fn server_name() -> ServerName {
+pub fn server_name() -> ServerName<'static> {
     ServerName::try_from("localhost").expect("server name")
 }
 

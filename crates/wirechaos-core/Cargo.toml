@@ -22,6 +22,7 @@ rustls.workspace = true
 sha2 = "0.10.0"
 hmac = "0.12.0"
 pbkdf2 = "0.12"
+md5 = "0.7"
 base64 = "0.23.1"
 rand = "0.8"
 subtle = "2.5"
@@ -32,6 +33,7 @@ zeroize = { version = "1.8", features = ["derive"] }
 arc-swap = "1.7"
 tokio-postgres = { workspace = true, optional = true }
 stringprep = "0.1"
+webpki-roots = "0.26"
 
 [features]
 # The pgbouncer-style `auth_query` source pulls in a SQL driver. It is off by

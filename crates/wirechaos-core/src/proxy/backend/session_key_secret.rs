@@ -7,7 +7,6 @@ pub struct SessionKeySecret {
 }
 
 impl SessionKeySecret {
-
     #[must_use]
     pub fn new() -> Self {
         let mut rng = thread_rng();

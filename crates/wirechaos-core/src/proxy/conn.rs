@@ -1,8 +1,8 @@
 use crate::proxy::auth::verifier::VerifierProvider;
-use crate::proxy::backend::connection::Backend;
 use crate::proxy::backend::registry::Registry;
 use crate::proxy::backend::registry::SessionGuard;
 use crate::proxy::backend::session_key_secret::SessionKeySecret;
+use crate::proxy::backend::{Backend, PgConfig, StartupNotification};
 use crate::proxy::buffer_pool::{MultiBufferPool, PooledBytes};
 use crate::proxy::config::Config;
 use crate::proxy::conn_read::ConnRead;
@@ -40,6 +40,8 @@ pub struct Conn<V: VerifierProvider> {
     pub backend_registry: Registry,
     pub session_key_secret: Option<SessionKeySecret>,
     pub backend: Option<Arc<Backend>>,
+    /// Whether the backend's SCRAM `v=` was checked with `ServerKey`.
+    pub server_signature_verified: bool,
     pub conn_registry: ConnRegistry,
     pub config: Arc<Config>,
     /// Kept alive for the session's lifetime so the registry entry — and with it
@@ -47,16 +49,17 @@ pub struct Conn<V: VerifierProvider> {
     session_guard: Option<SessionGuard>,
 }
 
-const CANCEL_REQUEST_CODE: u32 = (1234 << 16) | 5678;
-const SSL_REQUEST_CODE: u32 = (1234 << 16) | 5679;
-const GSSENC_REQUEST_CODE: u32 = (1234 << 16) | 5680;
+pub const CANCEL_REQUEST_CODE: u32 = (1234 << 16) | 5678;
+pub const SSL_REQUEST_CODE: u32 = (1234 << 16) | 5679;
+pub const GSSENC_REQUEST_CODE: u32 = (1234 << 16) | 5680;
 
 //protocol version
 const PROTOCOL_MAJOR_VERSION: u32 = 3;
 const PROTOCOL_MINOR_VERSION: u32 = 0;
-const PROTOCOL_VERSION_NUMBER: u32 = (PROTOCOL_MAJOR_VERSION << 16) | PROTOCOL_MINOR_VERSION;
+pub const PROTOCOL_VERSION_NUMBER: u32 = (PROTOCOL_MAJOR_VERSION << 16) | PROTOCOL_MINOR_VERSION;
 
 const MSG_PARAMETER_STATUS: u8 = b'S';
+const MSG_NOTICE: u8 = b'N';
 const MSG_KEY_SECRET: u8 = b'K';
 const MSG_READY_ACCEPT_QUERY: u8 = b'Z';
 const MSG_ERROR: u8 = b'E';
@@ -104,6 +107,7 @@ impl<V: VerifierProvider> Conn<V> {
             backend_registry: backend_pool,
             session_key_secret: None,
             backend: None,
+            server_signature_verified: false,
             conn_registry,
             config,
             session_guard: None,
@@ -178,7 +182,7 @@ impl<V: VerifierProvider> Conn<V> {
                 Ok(StartupOutCome::Continued)
             }
             CANCEL_REQUEST_CODE => {
-                self.handle_cancel_request(&mut message_reader)?;
+                self.handle_cancel_request(&mut message_reader).await?;
                 // A cancel connection is a dead end: no auth, no response.
                 Ok(StartupOutCome::Close)
             }
@@ -266,14 +270,76 @@ impl<V: VerifierProvider> Conn<V> {
 
         let client_key = self.handle_authentication().await?;
 
-        if client_key.is_none() {
+        let Some(client_key) = client_key else {
             // Rejected: `handle_authentication` already wrote the
             // ErrorResponse, so the driver must not send a second one. Close.
             return Ok(StartupOutCome::Close);
+        };
+
+        let user = self
+            .user
+            .clone()
+            .ok_or_else(|| connection_error(InvalidState))?;
+        let database = self
+            .database
+            .clone()
+            .ok_or_else(|| connection_error(InvalidState))?;
+
+        // The verifier that authenticated the client is also the one the
+        // backend link must use; `ClientKey` is bound to its salt/iterations.
+        let verifier = self
+            .provider
+            .lookup(&user)
+            .await
+            .map_err(ProxyError::internal)?
+            .ok_or_else(|| connection_error(InvalidState))?;
+
+        let (host, port) = self
+            .config
+            .backend_host_port()
+            .map_err(ProxyError::internal)?;
+
+        let mut tls = self.config.backend.tls.clone();
+        if tls.domain.is_none() {
+            tls.domain = self.config.backend.tls_server_name(&host);
         }
 
-        // todo:: the stub backend is replaced by the real link.
-        let backend = Arc::new(Backend::default());
+        let startup_params: Vec<(String, String)> = self
+            .params
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+
+        let pg_config = PgConfig::new(
+            Some(client_key),
+            Some(verifier.server_key().to_vec()),
+            Some(verifier.stored_key().to_vec()),
+            verifier.password().map(<[u8]>::to_vec),
+            user.clone(),
+            database,
+            self.config.backend.connect_timeout(),
+            self.config.backend.startup_timeout(),
+            host.clone(),
+            port,
+            tls,
+            verifier.salt().to_vec(),
+            verifier.iterations(),
+            startup_params,
+        );
+
+        let backend = Backend::new(pg_config, Arc::clone(&self.pool))
+            .await
+            .map_err(|error| {
+                // The client sees the generic mapped message; the operator gets
+                // the backend's own detail (never credential material).
+                tracing::error!(
+                    user = %user,
+                    backend = %format!("{host}:{port}"),
+                    error = %error,
+                    "backend link failed"
+                );
+                error
+            })?;
 
         let mut registered = None;
         for _ in 0..64 {
@@ -293,11 +359,12 @@ impl<V: VerifierProvider> Conn<V> {
         let (session_key_secret, guard) =
             registered.ok_or_else(|| connection_error(InvalidState))?;
 
+        self.server_signature_verified = backend.server_signature_verified();
         self.backend = Some(backend);
         self.session_key_secret = Some(session_key_secret);
         self.session_guard = Some(guard);
 
-        self.send_parameter_status().await?;
+        self.send_startup_notifications().await?;
         self.send_key_secret().await?;
         self.send_ready_signal().await?;
 
@@ -307,7 +374,7 @@ impl<V: VerifierProvider> Conn<V> {
     /// Route a `CancelRequest` to the session it names.
     ///
     /// Implemented by the session registry: see doc/tasks/09-session-registry.md.
-    fn handle_cancel_request(
+    async fn handle_cancel_request(
         &mut self,
         message_reader: &mut MessageReader,
     ) -> Result<(), ProxyError> {
@@ -321,8 +388,15 @@ impl<V: VerifierProvider> Conn<V> {
         let session_key_secret = SessionKeySecret { key: pid, secret };
 
         match self.backend_registry.lookup_by_key(session_key_secret) {
-            Some(_backend) => {
-                //todo
+            Some(backend) => {
+                if let Some(backend_key) = backend.backend_key() {
+                    if let Err(error) = backend.send_cancel_request(backend_key).await {
+                        // The target session's teardown may already be in
+                        // progress; a failed cancel must never affect this
+                        // (response-less) connection.
+                        tracing::warn!(session_pid = pid, %error, "cancel forwarding failed");
+                    }
+                }
             }
             None => tracing::debug!(
                 session_pid = pid,
@@ -496,24 +570,33 @@ impl<V: VerifierProvider> Conn<V> {
         Ok(())
     }
 
-    async fn send_parameter_status(&mut self) -> Result<(), ProxyError> {
-        let backend = match self.backend.as_ref() {
-            Some(value) => value,
+    /// Replay the backend's startup-phase `ParameterStatus` and
+    /// `NoticeResponse` messages to the client, preserving backend order.
+    async fn send_startup_notifications(&mut self) -> Result<(), ProxyError> {
+        let notifications = match self.backend.as_ref() {
+            Some(value) => value.startup_notifications().to_vec(),
             None => {
                 return Err(connection_error(InvalidData));
             }
         };
 
-        let parameters = backend.get_param_status_values();
+        for notification in notifications {
+            match notification {
+                StartupNotification::ParameterStatus(name, value) => {
+                    let mut buf = Vec::new();
+                    put_cstr(&mut buf, &name);
+                    put_cstr(&mut buf, &value);
 
-        for (name, value) in parameters {
-            let mut buf = Vec::new();
-            put_cstr(&mut buf, &name);
-            put_cstr(&mut buf, &value);
-
-            self.write_message(MSG_PARAMETER_STATUS, &buf)
-                .await
-                .map_err(ProxyError::internal)?;
+                    self.write_message(MSG_PARAMETER_STATUS, &buf)
+                        .await
+                        .map_err(ProxyError::internal)?;
+                }
+                StartupNotification::Notice(body) => {
+                    self.write_message(MSG_NOTICE, &body)
+                        .await
+                        .map_err(ProxyError::internal)?;
+                }
+            }
         }
 
         Ok(())
@@ -538,7 +621,11 @@ impl<V: VerifierProvider> Conn<V> {
     }
 
     async fn send_ready_signal(&mut self) -> Result<(), ProxyError> {
-        let buf = vec![b'I'];
+        let status = self
+            .backend
+            .as_ref()
+            .map_or(b'I', |backend| backend.ready_status());
+        let buf = vec![status];
         self.write_message(MSG_READY_ACCEPT_QUERY, &buf)
             .await
             .map_err(ProxyError::internal)?;

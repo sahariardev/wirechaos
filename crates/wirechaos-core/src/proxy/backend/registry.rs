@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
-use crate::proxy::backend::{connection::Backend, session_key_secret::SessionKeySecret};
+use crate::proxy::backend::{session_key_secret::SessionKeySecret, Backend, BackendKeyData};
 
 #[derive(Default)]
 struct Inner {
@@ -58,6 +58,15 @@ impl Registry {
     pub fn lookup_by_key(&self, key: SessionKeySecret) -> Option<Arc<Backend>> {
         self.lock().key_secret_backend.get(&key).cloned()
     }
+
+    /// The backend's real cancel key for a proxy-minted key.
+    ///
+    /// This is the task-9 handoff point: the key must never be sent to the
+    /// client, only used to open a `CancelRequest` connection to the backend.
+    pub fn lookup_backend_key(&self, key: SessionKeySecret) -> Option<BackendKeyData> {
+        self.lookup_by_key(key)
+            .and_then(|backend| backend.backend_key())
+    }
 }
 
 pub struct SessionGuard {
@@ -93,7 +102,7 @@ mod tests {
     fn registered_key_resolves_to_its_backend() {
         let registry = Registry::new();
         let _guard = registry
-            .register(Arc::new(Backend::default()), 123, key())
+            .register(Arc::new(Backend::for_test()), 123, key())
             .expect("first registration wins");
 
         assert!(registry.lookup_by_key(key()).is_some());
@@ -103,13 +112,13 @@ mod tests {
     fn a_duplicate_key_is_reported_instead_of_overwriting() {
         let registry = Registry::new();
         let _first = registry
-            .register(Arc::new(Backend::default()), 1, key())
+            .register(Arc::new(Backend::for_test()), 1, key())
             .expect("first registration wins");
 
         // A colliding key must be surfaced so the caller can re-mint, never
         // silently hijack the live session's cancel key.
         assert!(matches!(
-            registry.register(Arc::new(Backend::default()), 2, key()),
+            registry.register(Arc::new(Backend::for_test()), 2, key()),
             Err(collided) if collided == key()
         ));
     }
@@ -118,7 +127,7 @@ mod tests {
     fn the_guard_frees_the_key_on_drop() {
         let registry = Registry::new();
         let guard = registry
-            .register(Arc::new(Backend::default()), 1, key())
+            .register(Arc::new(Backend::for_test()), 1, key())
             .expect("registration");
         assert!(registry.lookup_by_key(key()).is_some());
 

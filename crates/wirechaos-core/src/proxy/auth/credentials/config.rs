@@ -28,7 +28,7 @@ pub enum SourceKind {
 }
 
 /// The raw `credentials:` block.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CredentialsConfig {
     #[serde(default)]
@@ -44,7 +44,7 @@ pub struct CredentialsConfig {
 }
 
 /// The raw `credentials.auth_query:` block.
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthQueryFileConfig {
     #[serde(default = "default_host")]

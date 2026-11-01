@@ -5,11 +5,6 @@ use serde::Deserialize;
 use crate::proxy::auth::credentials::{ConfigError, CredentialStore, CredentialsConfig};
 use crate::proxy::conn_registry::DEFAULT_MAX_CONNECTIONS;
 
-/// The startup-relevant subset of `wirechaos.yaml` (design §10).
-///
-/// Deliberately **no** top-level `deny_unknown_fields`: later tasks add
-/// `backend`, `chaos`, `control`, and `observability` blocks, and an older build
-/// must keep starting when it sees them.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -169,6 +164,18 @@ pub struct LimitsConfig {
 
     #[serde(default)]
     pub idle_timeout_ms: u64,
+
+    #[serde(default = "default_pool_max_bucket")]
+    pub pool_max_bucket: usize,
+
+    #[serde(default = "default_max_inflight_bytes")]
+    pub max_inflight_bytes: usize,
+
+    #[serde(default = "default_capture_query_text")]
+    pub capture_query_text: bool,
+
+    #[serde(default = "default_max_captured_query_bytes")]
+    pub max_captured_query_bytes: usize,
 }
 
 impl Default for LimitsConfig {
@@ -179,6 +186,10 @@ impl Default for LimitsConfig {
             max_startup_bytes: default_max_startup_bytes(),
             max_message_size: default_max_message_size(),
             idle_timeout_ms: 0,
+            pool_max_bucket: default_pool_max_bucket(),
+            max_inflight_bytes: default_max_inflight_bytes(),
+            capture_query_text: default_capture_query_text(),
+            max_captured_query_bytes: default_max_captured_query_bytes(),
         }
     }
 }
@@ -197,6 +208,22 @@ fn default_max_startup_bytes() -> usize {
 
 fn default_max_message_size() -> usize {
     1 << 30
+}
+
+fn default_pool_max_bucket() -> usize {
+    64 * 1024
+}
+
+fn default_max_inflight_bytes() -> usize {
+    1 * 1024 * 1024
+}
+
+fn default_capture_query_text() -> bool {
+    true
+}
+
+fn default_max_captured_query_bytes() -> usize {
+    8 * 1024
 }
 
 impl Config {

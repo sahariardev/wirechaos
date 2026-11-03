@@ -1,12 +1,12 @@
+use crate::proxy::buffer_pool::{MultiBufferPool, PooledBytes};
 use crate::relay::error::RelayError;
 use crate::relay::header::FrameHeader;
-use crate::relay::reader::FrameRead::Stream;
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use crate::proxy::buffer_pool::PooledBytes;
 
 pub(crate) enum FrameBody {
     Empty,
-    Bytes(Vec<u8>),
+    Bytes(PooledBytes),
 }
 
 pub(crate) struct Frame {
@@ -25,113 +25,74 @@ pub(crate) enum FrameRead {
 }
 
 pub(crate) struct FrameReader {
-    buffer: PooledBytes,
     max_message_size: usize,
-    start: usize,
-    end: usize,
+    pool: Arc<MultiBufferPool>,
 }
 
 impl FrameReader {
-    pub(crate) fn new(max_message_size: usize, buffer: PooledBytes) -> Self {
+    pub(crate) fn with_pool(max_message_size: usize, pool: Arc<MultiBufferPool>) -> Self {
         Self {
-            buffer,
             max_message_size,
-            start: 0,
-            end: 0,
+            pool,
         }
-    }
-
-    pub(crate) fn available(&self) -> usize {
-        self.end - self.start
     }
 
     pub(crate) async fn next_frame<R: AsyncRead + Unpin>(
         &mut self,
         reader: &mut R,
     ) -> Result<Option<FrameRead>, RelayError> {
-        while self.available() < 5 {
-            let n = self.fill(reader).await?;
-            if n == 0 {
-                if self.available() == 0 {
-                    return Ok(None);
-                }
-
-                return Err(RelayError::ConnectionClosed);
-            }
-        }
-
-        let type_byte = self.buffer[self.start];
-        self.start += 1;
-
-        let len = u32::from_be_bytes(self.buffer[self.start..self.start + 4].try_into().unwrap())
-            as usize;
-
-        self.start += 4;
+        let (type_byte, len) = self.read_type_len(reader).await?.unwrap();
 
         if len < 4 {
             return Err(RelayError::InvalidMessageLength { length: len });
         }
 
-        let len = len - 4;
-
-        if len > self.max_message_size {
-            let stream_header = StreamHeader {
-                type_byte,
-                body_len: len,
-            };
-
-            return Ok(Some(Stream(stream_header)));
-        }
-
-        let frame_header = FrameHeader {
-            type_byte,
-            body_len: len,
-        };
-
-        if len == 0 {
+        if len == 4 {
             return Ok(Some(FrameRead::Complete(Frame {
-                header: frame_header,
                 body: FrameBody::Empty,
+                header: FrameHeader {
+                    type_byte,
+                    body_len: len,
+                },
             })));
         }
 
-        while self.available() < len {
-            self.fill(reader).await?;
+        if len > self.max_message_size {
+            return Ok(Some(FrameRead::Stream(StreamHeader {
+                type_byte,
+                body_len: len,
+            })));
         }
 
-        let frame_body = FrameBody::Bytes(self.buffer[self.start..self.start + len].to_vec());
-
-        if self.available() < len {
-            return Err(RelayError::ConnectionClosed);
-        }
-
-        self.start += len;
-
-        if self.start == self.end {
-            self.start = 0;
-            self.end = 0;
-        }
-
-        Ok(Some(FrameRead::Complete(Frame {
-            header: frame_header,
-            body: frame_body,
-        })))
-    }
-
-    async fn fill<R: AsyncRead + Unpin>(&mut self, reader: &mut R) -> Result<usize, RelayError> {
-        if self.end == self.buffer.len() {
-            self.buffer.copy_within(self.start..self.end, 0);
-            self.end = self.end - self.start;
-            self.start = 0;
-        }
-
-        let n = reader
-            .read(&mut self.buffer[self.end..])
+        let mut buff = self.pool.get(len);
+        reader
+            .read_exact(&mut buff)
             .await
             .map_err(|_| RelayError::ConnectionClosed)?;
 
-        self.end += n;
+        Ok(Some(FrameRead::Complete(Frame {
+            body: FrameBody::Bytes(buff),
+            header: FrameHeader {
+                type_byte,
+                body_len: len,
+            },
+        })))
+    }
 
-        Ok(n)
+    async fn read_type_len<R: AsyncRead + Unpin>(
+        &mut self,
+        reader: &mut R,
+    ) -> Result<Option<(u8, usize)>, RelayError> {
+        //todo:: return Ok none when send 0 and no other bytes
+        let mut buf = [0u8; 5];
+        reader
+            .read_exact(&mut buf)
+            .await
+            .map_err(|_| RelayError::ConnectionClosed)?;
+
+        let type_byte = buf[0];
+        let len = u32::from_be_bytes(buf[1..5].try_into().unwrap()) as usize;
+
+        Ok(Some((type_byte, len)))
     }
 }

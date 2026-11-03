@@ -8,3 +8,4 @@ mod state;
 mod sessions;
 mod raw_pump;
 mod framed_pump;
+mod writer;

@@ -26,7 +26,7 @@ impl FrameWriter {
             .map_err(|_| RelayError::ConnectionClosed)?;
 
         match &frame.body {
-            FrameBody::Bytes(bytes) => {
+            FrameBody::Pooled(bytes) => {
                 writer
                     .write(bytes)
                     .await

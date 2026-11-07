@@ -1,16 +1,20 @@
-mod config;
-mod header;
-mod reader;
 mod buffer;
-mod error;
 mod classification;
-mod state;
-mod sessions;
-mod raw_pump;
+mod config;
+mod error;
 mod framed_pump;
+mod header;
+mod raw_pump;
+mod reader;
+mod sessions;
+mod state;
 mod writer;
 
-pub(crate) use config::{RelayConfig};
-pub(crate) use error::{RelayError, TearDownReason};
+#[allow(unused_imports)]
+pub(crate) use config::{RelayConfig, RelayConfigError};
+#[allow(unused_imports)]
+pub(crate) use error::{RelayError, TeardownReason};
+#[allow(unused_imports)]
 pub(crate) use framed_pump::PumpOutcome;
-pub(crate) use sessions::{Mode, RelayOutcome, RelaySession, RunOutcome};
+#[allow(unused_imports)]
+pub(crate) use sessions::{run, run_framed, run_raw, Mode, RelayOutcome, RelaySession, RunOutcome};

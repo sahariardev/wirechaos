@@ -3,9 +3,7 @@ use std::fmt;
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
-#[allow(
-    dead_code
-)]
+#[allow(dead_code)]
 pub(crate) struct RelayConfig {
     pub(crate) max_message_size: usize,
     pub(crate) idle_timeout: Option<Duration>,

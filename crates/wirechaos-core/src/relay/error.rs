@@ -12,9 +12,9 @@ pub(crate) enum RelayError {
     InvalidMessageLength {
         length: usize,
     },
-    MessageTooLong {
+    MessageTooLarge {
         length: usize,
-        max_length: usize,
+        max: usize,
     },
     ConnectionClosed,
     NotImplemented {
@@ -43,8 +43,8 @@ impl fmt::Display for RelayError {
             Self::InvalidMessageLength { length } => {
                 write!(f, "invalid message length: {length}")
             }
-            Self::MessageTooLong { length, max_length } => {
-                write!(f, "message length {length} exceeds maximum {max_length}")
+            Self::MessageTooLarge { length, max } => {
+                write!(f, "message length {length} exceeds maximum {max}")
             }
             Self::ConnectionClosed => write!(f, "connection closed"),
             Self::NotImplemented { task, what } => {
@@ -84,7 +84,7 @@ impl RelayError {
     pub(crate) fn sqlstate(&self) -> Option<&'static str> {
         match self {
             Self::InvalidMessageLength { .. }
-            | Self::MessageTooLong { .. }
+            | Self::MessageTooLarge { .. }
             | Self::UnexpectedEof { .. } => Some("08P01"),
             Self::Protocol { code, .. } => Some(code),
             _ => None,
@@ -96,7 +96,7 @@ impl RelayError {
         match self {
             Self::NotImplemented { .. } => "not implemented",
             Self::InvalidMessageLength { .. } => "invalid message length",
-            Self::MessageTooLong { .. } => "message length exceeds the configured maximum",
+            Self::MessageTooLarge { .. } => "message length exceeds the configured maximum",
             Self::ConnectionClosed => "connection closed",
             Self::UnexpectedEof { .. } => "unexpected end of message",
             Self::Protocol { message, .. } => message,

@@ -12,18 +12,14 @@ pub(crate) enum Mode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(
-    dead_code
-)]
+#[allow(dead_code)]
 pub(crate) struct RelayOutcome {
     pub(crate) mode: Mode,
     pub(crate) reason: TeardownReason,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(
-    dead_code
-)]
+#[allow(dead_code)]
 pub(crate) enum RunOutcome {
     Done(RelayOutcome),
     Switch(Mode),
@@ -40,9 +36,7 @@ pub(crate) struct RelaySession {
 }
 
 impl RelaySession {
-    #[allow(
-        dead_code
-    )]
+    #[allow(dead_code)]
     pub(crate) fn new(
         frontend_read: Box<dyn AsyncRead + Send + Unpin>,
         frontend_write: Box<dyn AsyncWrite + Send + Unpin>,
@@ -62,9 +56,7 @@ impl RelaySession {
     }
 }
 
-#[allow(
-    dead_code
-)]
+#[allow(dead_code)]
 pub(crate) async fn run(session: RelaySession) -> Result<RelayOutcome, RelayError> {
     let _ = session;
     Err(RelayError::NotImplemented {

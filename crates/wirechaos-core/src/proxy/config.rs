@@ -215,7 +215,7 @@ fn default_pool_max_bucket() -> usize {
 }
 
 fn default_max_inflight_bytes() -> usize {
-    1 * 1024 * 1024
+    1024 * 1024
 }
 
 fn default_capture_query_text() -> bool {

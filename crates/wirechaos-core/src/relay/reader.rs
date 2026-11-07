@@ -4,33 +4,39 @@ use crate::relay::header::{read_path_for, validate_header, FrameHeader, ReadPath
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
+#[allow(dead_code)]
 pub(crate) enum FrameBody {
     Empty,
     Pooled(PooledBytes),
 }
 
+#[allow(dead_code)]
 pub(crate) struct Frame {
     pub(crate) header: FrameHeader,
     pub(crate) body: FrameBody,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) struct StreamHeader {
     pub(crate) type_byte: u8,
     pub(crate) body_len: usize,
 }
 
+#[allow(dead_code)]
 pub(crate) enum FrameRead {
     Complete(Frame),
     Stream(StreamHeader),
 }
 
+#[allow(dead_code)]
 pub(crate) struct FrameReader {
     max_message_size: usize,
     pool_max_bucket: usize,
     pool: Arc<MultiBufferPool>,
 }
 
+#[allow(dead_code)]
 fn map_io(e: std::io::Error, context: &'static str) -> RelayError {
     if e.kind() == std::io::ErrorKind::UnexpectedEof {
         RelayError::UnexpectedEof { context }
@@ -40,6 +46,7 @@ fn map_io(e: std::io::Error, context: &'static str) -> RelayError {
 }
 
 impl FrameReader {
+    #[allow(dead_code)]
     pub(crate) fn with_pool(max_message_size: usize, pool: Arc<MultiBufferPool>) -> Self {
         let pool_max_bucket = pool.max_capacity();
         Self {
@@ -49,6 +56,7 @@ impl FrameReader {
         }
     }
 
+    #[allow(dead_code)]
     async fn read_header<R: AsyncRead + Unpin>(
         &mut self,
         reader: &mut R,
@@ -69,6 +77,7 @@ impl FrameReader {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn next_frame<R: AsyncRead + Unpin>(
         &mut self,
         reader: &mut R,

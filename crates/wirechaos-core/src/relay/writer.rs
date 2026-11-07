@@ -2,13 +2,16 @@ use crate::relay::error::RelayError;
 use crate::relay::reader::{Frame, FrameBody};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
+#[allow(dead_code)]
 pub(crate) struct FrameWriter {}
 
 impl FrameWriter {
+    #[allow(dead_code)]
     pub(crate) fn new() -> Self {
         Self {}
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn write_frame<W: AsyncWrite + Unpin>(
         &mut self,
         writer: &mut W,
@@ -31,6 +34,7 @@ impl FrameWriter {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn flush<W: AsyncWrite + Unpin>(
         &mut self,
         writer: &mut W,

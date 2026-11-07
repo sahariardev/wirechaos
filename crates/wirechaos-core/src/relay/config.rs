@@ -125,7 +125,7 @@ mod tests {
 
         assert_eq!(relay.max_message_size, 1 << 30);
         assert_eq!(relay.pool_max_bucket, 64 * 1024);
-        assert_eq!(relay.max_inflight_bytes, 1 * 1024 * 1024);
+        assert_eq!(relay.max_inflight_bytes, 1024 * 1024);
         assert!(relay.capture_query_text);
         assert_eq!(relay.max_captured_query_bytes, 8 * 1024);
         assert_eq!(relay.idle_timeout, None);

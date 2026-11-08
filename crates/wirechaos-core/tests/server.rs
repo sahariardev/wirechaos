@@ -26,7 +26,8 @@ async fn a_full_server_answers_53300_instead_of_refusing() {
         frontend_tls: None,
         pool_min: 4,
         pool_max: 1024,
-    });
+    })
+    .expect("default relay limits are valid");
     tokio::spawn(serve(listener, state));
 
     let mut tcp = TcpStream::connect(addr)
@@ -51,7 +52,8 @@ async fn an_abrupt_disconnect_does_not_stop_the_listener() {
         frontend_tls: None,
         pool_min: 4,
         pool_max: 1024,
-    });
+    })
+    .expect("default relay limits are valid");
     tokio::spawn(serve(listener, state));
 
     // Connect and drop without sending anything.

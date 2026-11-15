@@ -9,6 +9,7 @@ mod reader;
 mod sessions;
 mod state;
 mod writer;
+mod pending;
 
 #[allow(unused_imports)]
 pub(crate) use config::{RelayConfig, RelayConfigError};

@@ -1,6 +1,9 @@
 use crate::relay::classification::Direction;
+use crate::relay::classification::Direction::BackendToFrontend;
 use crate::relay::error::{RelayError, TeardownReason};
+use crate::relay::reader::FrameRead;
 use crate::relay::sessions::RelaySession;
+use tokio::io::AsyncReadExt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -15,11 +18,33 @@ impl RelaySession {
         &mut self,
         direction: Direction,
     ) -> Result<PumpOutcome, RelayError> {
-        let _ = (self, direction);
-        Err(RelayError::NotImplemented {
-            task: "pump_one",
-            what: "RelaySession::pump_one",
-        })
+        let mut reader = &mut self.frontend_read;
+        let mut writer = &mut self.backend_write;
+
+        if direction == BackendToFrontend {
+            let mut reader = &mut self.backend_read;
+            let mut writer = &mut self.frontend_write;
+        }
+
+        let frame = self.frame_reader.next_frame(&mut reader).await?;
+
+        match frame {
+            Some(frame_read) => match frame_read {
+                FrameRead::Complete(f) => {
+                    self.frame_writer.write_frame(&mut writer, &f).await?;
+                }
+                FrameRead::Stream(header) => {
+                    let buffer = self.pool.get(self.config.pool_max_bucket);
+
+                    self.frame_writer
+                        .write_streamed(&mut writer, &mut reader, &header, buffer)
+                        .await?;
+                }
+            },
+            None => {}
+        }
+
+        Ok(PumpOutcome::Continue)
     }
 }
 

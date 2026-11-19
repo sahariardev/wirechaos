@@ -1,6 +1,8 @@
 use crate::proxy::buffer_pool::MultiBufferPool;
 use crate::relay::config::RelayConfig;
 use crate::relay::error::{RelayError, TeardownReason};
+use crate::relay::reader::FrameReader;
+use crate::relay::writer::FrameWriter;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -33,6 +35,8 @@ pub(crate) struct RelaySession {
     pub(crate) backend_write: Box<dyn AsyncWrite + Send + Unpin>,
     pub(crate) config: Arc<RelayConfig>,
     pub(crate) pool: Arc<MultiBufferPool>,
+    pub(crate) frame_reader: FrameReader,
+    pub(crate) frame_writer: FrameWriter,
 }
 
 impl RelaySession {
@@ -45,6 +49,8 @@ impl RelaySession {
         config: Arc<RelayConfig>,
         pool: Arc<MultiBufferPool>,
     ) -> Self {
+        let max_message_size = config.max_message_size;
+        let pool_clone = pool.clone();
         Self {
             frontend_read,
             frontend_write,
@@ -52,6 +58,8 @@ impl RelaySession {
             backend_write,
             config,
             pool,
+            frame_reader: FrameReader::with_pool(max_message_size, pool_clone),
+            frame_writer: FrameWriter::new(),
         }
     }
 }

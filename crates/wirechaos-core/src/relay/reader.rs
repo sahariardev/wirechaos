@@ -1,6 +1,7 @@
 use crate::proxy::buffer_pool::{MultiBufferPool, PooledBytes};
 use crate::relay::error::RelayError;
 use crate::relay::header::{read_path_for, validate_header, FrameHeader, ReadPath};
+use bytes::{Buf, BytesMut};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -34,7 +35,18 @@ pub(crate) struct FrameReader {
     max_message_size: usize,
     pool_max_bucket: usize,
     pool: Arc<MultiBufferPool>,
+    partial: BytesMut,
+    in_progress: Option<BodyProgress>,
+    pending_stream: Option<StreamHeader>,
 }
+
+struct BodyProgress {
+    header: FrameHeader,
+    buffer: PooledBytes,
+    filled: usize,
+}
+
+const HEADER_LEN: usize = 5;
 
 #[allow(dead_code)]
 fn map_io(e: std::io::Error, context: &'static str) -> RelayError {
@@ -49,32 +61,42 @@ impl FrameReader {
     #[allow(dead_code)]
     pub(crate) fn with_pool(max_message_size: usize, pool: Arc<MultiBufferPool>) -> Self {
         let pool_max_bucket = pool.max_capacity();
+        Self::with_limits(max_message_size, pool_max_bucket, pool)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn with_limits(
+        max_message_size: usize,
+        pool_max_bucket: usize,
+        pool: Arc<MultiBufferPool>,
+    ) -> Self {
+        let pool_max_bucket = pool_max_bucket.min(pool.max_capacity());
         Self {
             max_message_size,
             pool_max_bucket,
             pool,
+            partial: BytesMut::new(),
+            in_progress: None,
+            pending_stream: None,
         }
     }
 
-    #[allow(dead_code)]
-    async fn read_header<R: AsyncRead + Unpin>(
+    async fn fill_to<R: AsyncRead + Unpin>(
         &mut self,
         reader: &mut R,
-    ) -> Result<Option<[u8; 5]>, RelayError> {
-        let mut first = [0u8; 1];
-        match reader.read(&mut first).await {
-            Ok(0) => Ok(None),
-            Ok(_) => {
-                let mut buf = [0u8; 5];
-                buf[0] = first[0];
-                reader
-                    .read_exact(&mut buf[1..])
-                    .await
-                    .map_err(|e| map_io(e, "header"))?;
-                Ok(Some(buf))
+        target: usize,
+        context: &'static str,
+    ) -> Result<bool, RelayError> {
+        while self.partial.len() < target {
+            let missing = target - self.partial.len();
+            let mut limited = (&mut *reader).take(missing as u64);
+            match limited.read_buf(&mut self.partial).await {
+                Ok(0) => return Ok(false),
+                Ok(_) => {}
+                Err(e) => return Err(map_io(e, context)),
             }
-            Err(e) => Err(map_io(e, "header")),
         }
+        Ok(true)
     }
 
     #[allow(dead_code)]
@@ -82,31 +104,159 @@ impl FrameReader {
         &mut self,
         reader: &mut R,
     ) -> Result<Option<FrameRead>, RelayError> {
-        let Some(header_buf) = self.read_header(reader).await? else {
-            return Ok(None);
+        if let Some(stream) = self.pending_stream {
+            return Err(RelayError::Protocol {
+                code: "0A000",
+                message: format!(
+                    "streamed body of {} bytes must be consumed before the next frame",
+                    stream.body_len
+                ),
+            });
+        }
+
+        if self.in_progress.is_some() {
+            let frame = self.finish_body(reader).await?;
+            return Ok(Some(FrameRead::Complete(frame)));
+        }
+
+        if !self.fill_to(reader, HEADER_LEN, "header").await? {
+            if self.partial.is_empty() {
+                return Ok(None);
+            }
+            self.partial.clear();
+            return Err(RelayError::UnexpectedEof { context: "header" });
+        }
+
+        let header_buf = [
+            self.partial[0],
+            self.partial[1],
+            self.partial[2],
+            self.partial[3],
+            self.partial[4],
+        ];
+        let header = match validate_header(&header_buf, self.max_message_size) {
+            Ok(header) => header,
+            Err(error) => {
+                // An invalid length makes the rest of the stream unparseable.
+                self.partial.clear();
+                return Err(error);
+            }
         };
-        let header = validate_header(&header_buf, self.max_message_size)?;
+        self.partial.advance(HEADER_LEN);
+
         match read_path_for(header.body_len, self.pool_max_bucket) {
             ReadPath::HeaderOnly => Ok(Some(FrameRead::Complete(Frame {
                 header,
                 body: FrameBody::Empty,
             }))),
             ReadPath::Pooled => {
-                let mut buf = self.pool.get(header.body_len);
-                reader
-                    .read_exact(&mut buf)
-                    .await
-                    .map_err(|e| map_io(e, "body"))?;
-                Ok(Some(FrameRead::Complete(Frame {
+                let buffer = self.pool.get(header.body_len);
+                self.in_progress = Some(BodyProgress {
                     header,
-                    body: FrameBody::Pooled(buf),
-                })))
+                    buffer,
+                    filled: 0,
+                });
+                let frame = self.finish_body(reader).await?;
+                Ok(Some(FrameRead::Complete(frame)))
             }
-            ReadPath::Streamed => Ok(Some(FrameRead::Stream(StreamHeader {
-                type_byte: header.type_byte,
-                body_len: header.body_len,
-            }))),
+            ReadPath::Streamed => {
+                let stream = StreamHeader {
+                    type_byte: header.type_byte,
+                    body_len: header.body_len,
+                };
+                self.pending_stream = Some(stream);
+                Ok(Some(FrameRead::Stream(stream)))
+            }
         }
+    }
+
+    async fn finish_body<R: AsyncRead + Unpin>(
+        &mut self,
+        reader: &mut R,
+    ) -> Result<Frame, RelayError> {
+        loop {
+            let (body_len, filled) = match self.in_progress.as_ref() {
+                Some(progress) => (progress.header.body_len, progress.filled),
+                None => {
+                    return Err(RelayError::Protocol {
+                        code: "XX000",
+                        message: "body read resumed without in-progress state".to_owned(),
+                    });
+                }
+            };
+            if filled >= body_len {
+                break;
+            }
+
+            let copied = {
+                let progress = match self.in_progress.as_mut() {
+                    Some(progress) => progress,
+                    None => {
+                        return Err(RelayError::Protocol {
+                            code: "XX000",
+                            message: "body read lost in-progress state".to_owned(),
+                        });
+                    }
+                };
+                let available = self.partial.len().min(body_len - progress.filled);
+                if available > 0 {
+                    let start = progress.filled;
+                    progress.buffer[start..start + available]
+                        .copy_from_slice(&self.partial[..available]);
+                    progress.filled += available;
+                }
+                available
+            };
+            if copied > 0 {
+                self.partial.advance(copied);
+                continue;
+            }
+
+            let read = {
+                let progress = match self.in_progress.as_mut() {
+                    Some(progress) => progress,
+                    None => {
+                        return Err(RelayError::Protocol {
+                            code: "XX000",
+                            message: "body read lost in-progress state".to_owned(),
+                        });
+                    }
+                };
+                let start = progress.filled;
+                reader.read(&mut progress.buffer[start..body_len]).await
+            };
+
+            match read {
+                Ok(0) => {
+                    self.in_progress = None;
+                    return Err(RelayError::UnexpectedEof { context: "body" });
+                }
+                Ok(n) => {
+                    if let Some(progress) = self.in_progress.as_mut() {
+                        progress.filled += n;
+                    }
+                }
+                Err(error) => {
+                    // A broken body cannot be resumed.
+                    self.in_progress = None;
+                    return Err(map_io(error, "body"));
+                }
+            }
+        }
+
+        let progress = match self.in_progress.take() {
+            Some(progress) => progress,
+            None => {
+                return Err(RelayError::Protocol {
+                    code: "XX000",
+                    message: "completed body disappeared from reader state".to_owned(),
+                });
+            }
+        };
+        Ok(Frame {
+            header: progress.header,
+            body: FrameBody::Pooled(progress.buffer),
+        })
     }
 }
 
@@ -114,6 +264,8 @@ impl FrameReader {
 mod tests {
     use super::*;
     use std::io::Error as IoError;
+    use tokio::io::AsyncWriteExt;
+    use tokio::time::{timeout, Duration};
 
     fn msg(type_byte: u8, body: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(5 + body.len());
@@ -140,11 +292,24 @@ mod tests {
     struct MemReader {
         data: Vec<u8>,
         pos: usize,
+        max_chunk: usize,
     }
 
     impl MemReader {
         fn new(data: Vec<u8>) -> Self {
-            Self { data, pos: 0 }
+            Self {
+                data,
+                pos: 0,
+                max_chunk: usize::MAX,
+            }
+        }
+
+        fn chunked(data: Vec<u8>, max_chunk: usize) -> Self {
+            Self {
+                data,
+                pos: 0,
+                max_chunk,
+            }
         }
     }
 
@@ -159,7 +324,7 @@ mod tests {
                 return std::task::Poll::Ready(Ok(()));
             }
             let remaining = &me.data[me.pos..];
-            let n = buf.remaining().min(remaining.len());
+            let n = buf.remaining().min(remaining.len()).min(me.max_chunk);
             buf.put_slice(&remaining[..n]);
             me.pos += n;
             std::task::Poll::Ready(Ok(()))
@@ -285,6 +450,8 @@ mod tests {
             _ => panic!("expected Complete for header only"),
         }
 
+        // The pool still has a usable pre-allocated bucket: the reader did not
+        // rent (and leak) a buffer for the empty body.
         let mut next = pool.get(8);
         next.copy_from_slice(&[1u8; 8]);
     }
@@ -364,6 +531,164 @@ mod tests {
             let mut b = pool.get(8);
             assert_eq!(b.len(), 8);
             b.copy_from_slice(&[0u8; 8]);
+        }
+    }
+
+    #[tokio::test]
+    async fn multiple_frames_in_one_read_are_drained() {
+        let pool = MultiBufferPool::new(4, 64, 1);
+        let mut r = FrameReader::with_pool(4096, Arc::clone(&pool));
+
+        let mut wire = msg(b'Q', b"one");
+        wire.extend_from_slice(&msg(b'H', b""));
+        wire.extend_from_slice(&msg(b'D', b"three"));
+
+        let mut cur = MemReader::new(wire);
+
+        let first = r.next_frame(&mut cur).await.expect("first").expect("frame");
+        let second = r
+            .next_frame(&mut cur)
+            .await
+            .expect("second")
+            .expect("frame");
+        let third = r.next_frame(&mut cur).await.expect("third").expect("frame");
+        let end = r.next_frame(&mut cur).await.expect("eof");
+
+        match first {
+            FrameRead::Complete(f) => assert_eq!(body_bytes(&f), b"one"),
+            _ => panic!("expected complete first"),
+        }
+        match second {
+            FrameRead::Complete(f) => {
+                assert_eq!(f.header.type_byte, b'H');
+                assert_eq!(body_bytes(&f), b"");
+            }
+            _ => panic!("expected complete second"),
+        }
+        match third {
+            FrameRead::Complete(f) => assert_eq!(body_bytes(&f), b"three"),
+            _ => panic!("expected complete third"),
+        }
+        assert!(end.is_none());
+    }
+
+    #[tokio::test]
+    async fn zero_length_body_is_a_frame() {
+        let pool = MultiBufferPool::new(4, 64, 1);
+        let mut r = FrameReader::with_pool(4096, Arc::clone(&pool));
+        let mut cur = MemReader::new(msg(b'S', b""));
+
+        match r.next_frame(&mut cur).await.expect("empty frame") {
+            Some(FrameRead::Complete(f)) => {
+                assert_eq!(f.header.type_byte, b'S');
+                assert_eq!(f.header.body_len, 0);
+                assert!(matches!(f.body, FrameBody::Empty));
+            }
+            _ => panic!("empty body must be a frame, not EOF"),
+        }
+        assert!(r.next_frame(&mut cur).await.expect("clean eof").is_none());
+    }
+
+    #[tokio::test]
+    async fn eof_mid_frame_is_a_typed_error() {
+        let pool = MultiBufferPool::new(4, 64, 1);
+        let mut r = FrameReader::with_pool(4096, Arc::clone(&pool));
+
+        let mut wire = msg(b'Q', &[0u8; 8]);
+        wire.truncate(5 + 3);
+        let mut cur = MemReader::new(wire);
+
+        let err = match r.next_frame(&mut cur).await {
+            Ok(_frame) => panic!("truncated body returned a frame"),
+            Err(error) => error,
+        };
+        assert!(matches!(err, RelayError::UnexpectedEof { context: "body" }));
+    }
+
+    #[tokio::test]
+    async fn chunking_never_changes_message_boundaries() {
+        let pool = MultiBufferPool::new(4, 64, 2);
+        let mut wire = msg(b'Q', b"alpha");
+        wire.extend_from_slice(&msg(b'H', b""));
+        wire.extend_from_slice(&msg(b'd', b"0123456789"));
+
+        for chunk in [1usize, 2, 3, 5, 7, 64] {
+            let mut r = FrameReader::with_pool(4096, Arc::clone(&pool));
+            let mut cur = MemReader::chunked(wire.clone(), chunk);
+            let mut seen = Vec::new();
+
+            loop {
+                match r.next_frame(&mut cur).await.expect("chunked frame") {
+                    Some(FrameRead::Complete(f)) => {
+                        seen.push((f.header.type_byte, body_bytes(&f)));
+                    }
+                    Some(FrameRead::Stream(_)) => panic!("unexpected stream"),
+                    None => break,
+                }
+            }
+
+            assert_eq!(seen.len(), 3, "chunk size {chunk} lost a frame");
+            assert_eq!(seen[0], (b'Q', b"alpha".to_vec()));
+            assert_eq!(seen[1], (b'H', Vec::new()));
+            assert_eq!(seen[2], (b'd', b"0123456789".to_vec()));
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_header_read_preserves_buffered_bytes() {
+        let pool = MultiBufferPool::new(4, 64, 1);
+        let mut r = FrameReader::with_pool(4096, Arc::clone(&pool));
+        let (mut relay_side, mut peer) = tokio::io::duplex(64);
+
+        let wire = msg(b'Q', b"cancel me");
+        peer.write_all(&wire[..3]).await.expect("partial header");
+
+        // This read blocks after consuming three header bytes. Dropping the
+        // future must not discard them.
+        let first = timeout(Duration::from_millis(20), r.next_frame(&mut relay_side)).await;
+        assert!(first.is_err(), "partial header must not produce a frame");
+
+        peer.write_all(&wire[3..]).await.expect("rest of frame");
+
+        let frame = timeout(Duration::from_millis(200), r.next_frame(&mut relay_side))
+            .await
+            .expect("second read completes")
+            .expect("frame result")
+            .expect("complete frame");
+        match frame {
+            FrameRead::Complete(f) => assert_eq!(body_bytes(&f), b"cancel me"),
+            _ => panic!("expected complete frame after cancellation"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_body_read_resumes_without_losing_bytes() {
+        let pool = MultiBufferPool::new(4, 64, 1);
+        let mut r = FrameReader::with_pool(4096, Arc::clone(&pool));
+        let (mut relay_side, mut peer) = tokio::io::duplex(64);
+
+        let wire = msg(b'Q', b"cancel body");
+        // Header plus two body bytes: the reader rents a buffer and then
+        // blocks mid-body.
+        peer.write_all(&wire[..7]).await.expect("header + body");
+
+        let first = timeout(Duration::from_millis(20), r.next_frame(&mut relay_side)).await;
+        assert!(first.is_err(), "partial body must not produce a frame");
+        assert!(
+            r.in_progress.is_some(),
+            "the rented body must survive cancellation"
+        );
+
+        peer.write_all(&wire[7..]).await.expect("rest of body");
+
+        let frame = timeout(Duration::from_millis(200), r.next_frame(&mut relay_side))
+            .await
+            .expect("second read completes")
+            .expect("frame result")
+            .expect("complete frame");
+        match frame {
+            FrameRead::Complete(f) => assert_eq!(body_bytes(&f), b"cancel body"),
+            _ => panic!("expected complete frame after body cancellation"),
         }
     }
 }

@@ -1,16 +1,16 @@
 mod buffer;
+mod capture;
 mod classification;
 mod config;
 mod error;
 mod framed_pump;
 mod header;
+mod pending;
 mod raw_pump;
 mod reader;
 mod sessions;
 mod state;
 mod writer;
-mod pending;
-mod capture;
 
 #[allow(unused_imports)]
 pub(crate) use config::{RelayConfig, RelayConfigError};

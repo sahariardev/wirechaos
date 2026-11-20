@@ -1,5 +1,8 @@
+use crate::relay::capture::QueryCapture;
 use crate::relay::classification::{Direction, MessageInfo, MessageKind, PhaseTracker};
+use crate::relay::config::RelayConfig;
 use crate::relay::error::RelayError;
+use crate::relay::pending::PendingQueries;
 use crate::relay::reader::{Frame, FrameBody};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +28,8 @@ pub(crate) struct SessionState {
     pub(crate) txn: TxnStatus,
     pub(crate) copy: CopyMode,
     pub(crate) phase: PhaseTracker,
+    pending: PendingQueries,
+    capture: QueryCapture,
 }
 
 impl SessionState {
@@ -35,9 +40,20 @@ impl SessionState {
             txn: TxnStatus::Idle,
             copy: CopyMode::None,
             phase: PhaseTracker::new(),
+            pending: PendingQueries::new(),
+            capture: QueryCapture::new(false, 0),
         }
     }
-
+    
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn with_config(config: &RelayConfig) -> Self {
+        let mut state = Self::new();
+        state.capture =
+            QueryCapture::new(config.capture_query_text, config.max_captured_query_bytes);
+        state
+    }
+    
     #[allow(dead_code)]
     pub(crate) fn observe(&mut self, info: &MessageInfo, frame: &Frame) -> Result<(), RelayError> {
         self.phase.observe(info);
@@ -78,6 +94,16 @@ impl SessionState {
             }
             (MessageKind::CopyData, _) if self.copy == CopyMode::None => {}
             _ => {}
+        }
+        
+        match info.direction {
+            Direction::FrontendToBackend => {
+                self.pending.observe_frontend(info.kind);
+                self.capture.capture(info, body_bytes(frame));
+            }
+            Direction::BackendToFrontend => {
+                self.pending.observe_backend(info.kind);
+            }
         }
 
         Ok(())
@@ -225,5 +251,24 @@ mod tests {
         assert_eq!(s.copy, CopyMode::None);
         observe_msg(&mut s, Direction::FrontendToBackend, b'd', b"data").unwrap();
         assert_eq!(s.copy, CopyMode::None);
+    }
+
+    #[test]
+    fn observe_updates_pending_queries_and_query_capture() {
+        // 6.12 integration proof: the state object now carries the 6.9/6.10
+        // trackers, so a normal `Q` -> `Z` round updates both.
+        let config = crate::proxy::config::Config::default();
+        let relay = RelayConfig::from_config(&config).expect("default config");
+        let mut s = SessionState::with_config(&relay);
+
+        observe_msg(&mut s, Direction::FrontendToBackend, b'Q', b"SELECT 1\0").unwrap();
+        assert_eq!(s.pending.pending(), 1);
+        assert_eq!(
+            s.capture.last().map(|query| query.text.as_str()),
+            Some("SELECT 1")
+        );
+
+        observe_msg(&mut s, Direction::BackendToFrontend, b'Z', b"I").unwrap();
+        assert_eq!(s.pending.pending(), 0);
     }
 }

@@ -1,7 +1,6 @@
-use crate::proxy::buffer_pool::PooledBytes;
 use crate::relay::error::RelayError;
-use crate::relay::reader::{Frame, FrameBody, StreamHeader};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use crate::relay::reader::{Frame, FrameBody};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 #[allow(dead_code)]
 pub(crate) struct FrameWriter {}
@@ -13,89 +12,26 @@ impl FrameWriter {
     }
 
     pub(crate) async fn write_frame<W: AsyncWrite + Unpin>(
-        &self,
+        &mut self,
         writer: &mut W,
         frame: &Frame,
     ) -> Result<(), RelayError> {
-        let len = (frame.header.body_len + 4) as u32;
+        let declared_len = (frame.header.body_len as u32).saturating_add(4);
         let mut header = [0u8; 5];
         header[0] = frame.header.type_byte;
-        header[1..5].copy_from_slice(&len.to_be_bytes());
+        header[1..5].copy_from_slice(&declared_len.to_be_bytes());
+
         writer.write_all(&header).await.map_err(RelayError::Io)?;
         match &frame.body {
-            FrameBody::Pooled(bytes) => {
+            FrameBody::Pooled(body) => {
                 writer
-                    .write_all(bytes.as_slice())
+                    .write_all(body.as_slice())
                     .await
                     .map_err(RelayError::Io)?;
             }
+            // Zero-body frames are exactly five bytes: type + length(4).
             FrameBody::Empty => {}
         }
-        Ok(())
-    }
-
-    pub(crate) async fn write_streamed<W, R>(
-        &self,
-        writer: &mut W,
-        reader: &mut R,
-        stream_header: &StreamHeader,
-        buffer: PooledBytes,
-    ) -> Result<(), RelayError>
-    where
-        W: AsyncWrite + Unpin,
-        R: AsyncRead + Unpin,
-    {
-        let len = (stream_header.body_len + 4) as u32;
-        let mut header = [0u8; 5];
-        header[0] = stream_header.type_byte;
-        header[1..5].copy_from_slice(&len.to_be_bytes());
-        writer.write_all(&header).await.map_err(RelayError::Io)?;
-        self.handle_stream_writing(reader, writer, buffer, stream_header.body_len)
-            .await?;
-
-        Ok(())
-    }
-
-    async fn handle_stream_writing<R, W>(
-        &self,
-        reader: &mut R,
-        writer: &mut W,
-        mut buffer: PooledBytes,
-        mut total_size: usize,
-    ) -> Result<(), RelayError>
-    where
-        R: AsyncRead + Unpin,
-        W: AsyncWrite + Unpin,
-    {
-        loop {
-            if total_size == 0 {
-                break;
-            }
-
-            let mut read_max_length = buffer.len();
-            if total_size < read_max_length {
-                read_max_length = total_size;
-            }
-
-            let read_data_size = reader
-                .read_exact(&mut buffer[0..read_max_length])
-                .await
-                .map_err(|e| RelayError::Io(e))?;
-
-            total_size -= read_data_size;
-
-            if read_data_size == 0 {
-                return Err(RelayError::UnexpectedEof {
-                    context: "Unexpected end of stream",
-                });
-            }
-
-            writer
-                .write_all(&buffer[0..read_data_size])
-                .await
-                .map_err(|e| RelayError::Io(e))?;
-        }
-
         Ok(())
     }
 

@@ -48,6 +48,20 @@ impl RelayConfig {
             ));
         }
 
+        if limits.max_message_size > u32::MAX as usize {
+            // The PostgreSQL length field is 32-bit. Accepting a larger cap
+            // would let the writer truncate/saturate the length and corrupt the
+            // stream, so reject it at config load instead.
+            return Err(invalid(
+                "limits.max_message_size",
+                limits.max_message_size,
+                format!(
+                    "must be <= {} (PostgreSQL length field is 32 bits)",
+                    u32::MAX
+                ),
+            ));
+        }
+
         if limits.pool_max_bucket == 0 {
             return Err(invalid(
                 "limits.pool_max_bucket",

@@ -1,11 +1,14 @@
 use crate::proxy::buffer_pool::MultiBufferPool;
+use crate::relay::classification::Direction;
 use crate::relay::config::RelayConfig;
 use crate::relay::error::{RelayError, TeardownReason};
-use crate::relay::reader::FrameReader;
+use crate::relay::raw_pump::{copy_direction, RawStop, ShutdownSignal};
+use crate::relay::reader::{FrameRead, FrameReader};
 use crate::relay::state::SessionState;
 use crate::relay::writer::FrameWriter;
+use crate::relay::PumpOutcome;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -41,6 +44,8 @@ pub(crate) struct RelaySession {
     pub(crate) frontend_writer: FrameWriter,
     pub(crate) backend_writer: FrameWriter,
     pub(crate) state: SessionState,
+
+    pub(crate) shutdown: ShutdownSignal,
 }
 
 impl RelaySession {
@@ -52,6 +57,7 @@ impl RelaySession {
         backend_write: Box<dyn AsyncWrite + Send + Unpin>,
         config: Arc<RelayConfig>,
         pool: Arc<MultiBufferPool>,
+        shutdown: ShutdownSignal,
     ) -> Self {
         let max_message_size = config.max_message_size;
         let pool_max_bucket = config.pool_max_bucket;
@@ -75,6 +81,7 @@ impl RelaySession {
             state: SessionState::with_config(&config),
             config,
             pool,
+            shutdown,
         }
     }
 }
@@ -90,20 +97,108 @@ pub(crate) async fn run(session: RelaySession) -> Result<RelayOutcome, RelayErro
 
 #[allow(dead_code)]
 pub(crate) async fn run_raw(session: &mut RelaySession) -> Result<RunOutcome, RelayError> {
-    let _ = session;
-    Err(RelayError::NotImplemented {
-        task: "run_raw",
-        what: "relay::run_raw",
-    })
+    let mut frontend_shutdown = session.shutdown.clone();
+    let mut backend_shutdown = session.shutdown.clone();
+    let frontend_pool = Arc::clone(&session.pool);
+    let backend_pool = Arc::clone(&session.pool);
+    let chunk_size = session.config.max_inflight_bytes;
+
+    let frontend = copy_direction(
+        &mut session.frontend_read,
+        &mut session.backend_write,
+        &mut frontend_shutdown,
+        frontend_pool,
+        chunk_size,
+    );
+
+    let backend = copy_direction(
+        &mut session.backend_read,
+        &mut session.frontend_write,
+        &mut backend_shutdown,
+        backend_pool,
+        chunk_size,
+    );
+
+    let (frontend, backend) = tokio::join!(frontend, backend);
+    let frontend = frontend?;
+    let backend = backend?;
+
+    let reason = match (frontend, backend) {
+        (RawStop::Shutdown, _) | (_, RawStop::Shutdown) => TeardownReason::Unknown,
+        (RawStop::Eof, RawStop::Eof) => TeardownReason::Unknown,
+    };
+
+    Ok(RunOutcome::Done(RelayOutcome {
+        mode: Mode::Raw,
+        reason,
+    }))
 }
 
 #[allow(dead_code)]
 pub(crate) async fn run_framed(session: &mut RelaySession) -> Result<RunOutcome, RelayError> {
-    let _ = session;
-    Err(RelayError::NotImplemented {
-        task: "run_framed",
-        what: "relay::run_framed",
-    })
+    loop {
+        let selected = tokio::select! {
+          changed = session.shutdown.changed() => {
+                let _ = changed;
+                return Ok(RunOutcome::Done(RelayOutcome {
+                    mode: Mode::Framed,
+                    reason: TeardownReason::Unknown
+                }))
+            }
+
+            result = session.frontend_reader.next_frame(&mut session.frontend_read) => {
+                (Direction::FrontendToBackend, result?)
+            }
+
+            result = session.backend_reader.next_frame(&mut session.backend_read) => {
+                (Direction::FrontendToBackend, result?)
+            }
+        };
+
+        let (direction, frame) = selected;
+
+        match frame {
+            None => {
+                half_close(session, direction).await?;
+
+                return Ok(RunOutcome::Done(RelayOutcome {
+                    mode: Mode::Framed,
+                    reason: TeardownReason::Unknown,
+                }));
+            }
+            Some(FrameRead::Complete(frame)) => {
+                if let PumpOutcome::Stop(reason) = session.forward_one(direction, frame).await? {
+                    return Ok(RunOutcome::Done(RelayOutcome {
+                        mode: Mode::Framed,
+                        reason,
+                    }));
+                }
+            }
+
+            Some(FrameRead::Stream(header)) => {
+                return Err(RelayError::NotImplemented {
+                    task: "run_framed",
+                    what: "relay::run_framed",
+                });
+            }
+        }
+    }
+}
+
+async fn half_close(session: &mut RelaySession, direction: Direction) -> Result<(), RelayError> {
+    match direction {
+        Direction::FrontendToBackend => session
+            .backend_write
+            .shutdown()
+            .await
+            .map_err(RelayError::Io),
+
+        Direction::BackendToFrontend => session
+            .frontend_write
+            .shutdown()
+            .await
+            .map_err(RelayError::Io),
+    }
 }
 
 #[cfg(test)]

@@ -98,6 +98,10 @@ impl FrameReader {
         }
         Ok(true)
     }
+    
+    pub(crate) fn is_at_boundary(&self) -> bool {
+        todo!("implement this")
+    }
 
     #[allow(dead_code)]
     pub(crate) async fn next_frame<R: AsyncRead + Unpin>(

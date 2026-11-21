@@ -6,7 +6,7 @@ use crate::relay::raw_pump::{copy_direction, RawStop, ShutdownSignal};
 use crate::relay::reader::{FrameRead, FrameReader};
 use crate::relay::state::SessionState;
 use crate::relay::writer::FrameWriter;
-use crate::relay::PumpOutcome;
+use crate::relay::{decide_mode, EpochWatcher, ModePlan, PumpOutcome, SessionFilters};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
@@ -44,6 +44,12 @@ pub(crate) struct RelaySession {
     pub(crate) frontend_writer: FrameWriter,
     pub(crate) backend_writer: FrameWriter,
     pub(crate) state: SessionState,
+    pub(crate) plan: Arc<dyn ModePlan>,
+    pub(crate) filters: SessionFilters,
+    pub(crate) chaos_enabled: bool,
+    pub(crate) epoch: EpochWatcher,
+    pub(crate) mode: Mode,
+    pub(crate) raw_in_flight: bool,
 
     pub(crate) shutdown: ShutdownSignal,
 }
@@ -58,6 +64,10 @@ impl RelaySession {
         config: Arc<RelayConfig>,
         pool: Arc<MultiBufferPool>,
         shutdown: ShutdownSignal,
+        plan: Arc<dyn ModePlan>,
+        filters: SessionFilters,
+        chaos_enabled: bool,
+        epoch_watcher: EpochWatcher,
     ) -> Self {
         let max_message_size = config.max_message_size;
         let pool_max_bucket = config.pool_max_bucket;
@@ -82,17 +92,59 @@ impl RelaySession {
             config,
             pool,
             shutdown,
+            plan,
+            epoch: epoch_watcher,
+            filters,
+            chaos_enabled,
+            mode: Mode::Raw,
+            raw_in_flight: false,
         }
+    }
+
+    pub(crate) fn desired_mode(&self) -> Mode {
+        decide_mode(self.plan.as_ref(), &self.filters, self.chaos_enabled)
+    }
+
+    pub(crate) fn framed_at_boundary(&self) -> bool {
+        self.frontend_reader.is_at_boundary() && self.backend_reader.is_at_boundary()
+    }
+
+    pub(crate) fn raw_quiescent(&self) -> bool {
+        !self.raw_in_flight
     }
 }
 
 #[allow(dead_code)]
-pub(crate) async fn run(session: RelaySession) -> Result<RelayOutcome, RelayError> {
-    let _ = session;
-    Err(RelayError::NotImplemented {
-        task: "6.1",
-        what: "relay::run",
-    })
+pub(crate) async fn run(mut session: RelaySession) -> Result<RelayOutcome, RelayError> {
+    loop {
+        let mode = session.desired_mode();
+        session.mode = mode;
+
+        match mode {
+            Mode::Raw => match run_raw(&mut session).await? {
+                RunOutcome::Done(outcome) => return Ok(outcome),
+                RunOutcome::Switch(next) => {
+                    if next == Mode::Raw {
+                        return Err(RelayError::Protocol {
+                            code: "XX000",
+                            message: "same-mode raw switch is a logic buug".to_owned(),
+                        });
+                    }
+                }
+            },
+            Mode::Framed => match run_framed(&mut session).await? {
+                RunOutcome::Done(outcome) => return Ok(outcome),
+                RunOutcome::Switch(next) => {
+                    if next == Mode::Framed {
+                        return Err(RelayError::Protocol {
+                            code: "XX000",
+                            message: "same-mode raw switch is a logic buug".to_owned(),
+                        });
+                    }
+                }
+            },
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -127,6 +179,13 @@ pub(crate) async fn run_raw(session: &mut RelaySession) -> Result<RunOutcome, Re
         (RawStop::Shutdown, _) | (_, RawStop::Shutdown) => TeardownReason::Unknown,
         (RawStop::Eof, RawStop::Eof) => TeardownReason::Unknown,
     };
+
+    if session.epoch.changed() {
+        let desired = session.desired_mode();
+        if desired != Mode::Raw && session.raw_quiescent() {
+            return Ok(RunOutcome::Switch(desired));
+        }
+    }
 
     Ok(RunOutcome::Done(RelayOutcome {
         mode: Mode::Raw,
@@ -172,6 +231,14 @@ pub(crate) async fn run_framed(session: &mut RelaySession) -> Result<RunOutcome,
                         mode: Mode::Framed,
                         reason,
                     }));
+                }
+
+                if session.epoch.changed() {
+                    let desired = session.desired_mode();
+
+                    if desired != Mode::Framed && session.framed_at_boundary() {
+                        return Ok(RunOutcome::Switch(desired));
+                    }
                 }
             }
 

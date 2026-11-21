@@ -1,6 +1,7 @@
 use crate::relay::classification::{classify, Direction, MessageKind};
 use crate::relay::error::{RelayError, TeardownReason};
-use crate::relay::reader::{Frame, FrameRead};
+use crate::relay::header::FrameHeader;
+use crate::relay::reader::{Frame, FrameBody, FrameRead, StreamHeader};
 use crate::relay::sessions::RelaySession;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,16 +33,7 @@ impl RelaySession {
         match frame {
             None => Ok(PumpOutcome::Stop(TeardownReason::Unknown)),
             Some(FrameRead::Complete(frame)) => self.forward_one(direction, frame).await,
-            Some(FrameRead::Stream(header)) => {
-
-                Err(RelayError::Protocol {
-                    code: "0A000",
-                    message: format!(
-                        "streamed relay message ({} bytes) is not implemented until task 6.15",
-                        header.body_len
-                    ),
-                })
-            }
+            Some(FrameRead::Stream(header)) => self.forward_stream(direction, header).await,
         }
     }
 
@@ -71,6 +63,73 @@ impl RelaySession {
                 if flush_now {
                     self.frontend_writer.flush(&mut self.frontend_write).await?;
                 }
+            }
+        }
+
+        Ok(PumpOutcome::Continue)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn forward_stream(
+        &mut self,
+        direction: Direction,
+        header: StreamHeader,
+    ) -> Result<PumpOutcome, RelayError> {
+        let info = classify(direction, header.type_byte);
+
+        let header_frame = Frame {
+            header: FrameHeader {
+                type_byte: header.type_byte,
+                body_len: header.body_len,
+            },
+            body: FrameBody::Empty,
+        };
+
+        self.state.observe(&info, &header_frame)?;
+
+        let mut remaining = header.body_len;
+
+        match direction {
+            Direction::FrontendToBackend => {
+                self.backend_writer
+                    .write_header(&mut self.backend_write, &header)
+                    .await?;
+
+                while remaining > 0 {
+                    let chunk = self
+                        .frontend_reader
+                        .read_body_chunk(&mut self.frontend_read, remaining)
+                        .await?;
+
+                    let chunk_len = chunk.len();
+                    self.backend_writer
+                        .write_body_chunk(&mut self.backend_write, &chunk)
+                        .await?;
+                    remaining -= chunk_len;
+                }
+
+                self.frontend_reader.finish_stream();
+            }
+
+            Direction::BackendToFrontend => {
+                self.frontend_writer
+                    .write_header(&mut self.frontend_write, &header)
+                    .await?;
+
+                while remaining > 0 {
+                    let chunk = self
+                        .backend_reader
+                        .read_body_chunk(&mut self.backend_read, remaining)
+                        .await?;
+
+                    let chunk_len = chunk.len();
+                    self.frontend_writer
+                        .write_body_chunk(&mut self.frontend_write, &chunk)
+                        .await?;
+                    remaining -= chunk_len;
+                }
+
+                self.backend_reader.finish_stream();
             }
         }
 

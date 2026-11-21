@@ -81,6 +81,38 @@ impl FrameReader {
         }
     }
 
+    pub(crate) async fn read_body_chunk<R: AsyncRead + Unpin>(
+        &mut self,
+        reader: &mut R,
+        remaining: usize,
+    ) -> Result<PooledBytes, RelayError> {
+        let stream = self.pending_stream.ok_or_else(|| RelayError::Protocol {
+            code: "XX000",
+            message: "stream chunk requested without a stream header".to_owned(),
+        })?;
+
+        if remaining == 0 || remaining > stream.body_len {
+            return Err(RelayError::Protocol {
+                code: "XX000",
+                message: "stream chunk size is outside the declared body".to_owned(),
+            });
+        }
+
+        let want = remaining.min(self.pool_max_bucket);
+        let mut chunk = self.pool.get(want);
+
+        reader
+            .read_exact(&mut chunk)
+            .await
+            .map_err(|error| map_io(error, "stream body"))?;
+
+        Ok(chunk)
+    }
+
+    pub(crate) fn finish_stream(&mut self) {
+        self.pending_stream = None;
+    }
+
     async fn fill_to<R: AsyncRead + Unpin>(
         &mut self,
         reader: &mut R,
@@ -98,9 +130,9 @@ impl FrameReader {
         }
         Ok(true)
     }
-    
+
     pub(crate) fn is_at_boundary(&self) -> bool {
-        todo!("implement this")
+        self.partial.is_empty() && self.in_progress.is_none() && self.pending_stream.is_none()
     }
 
     #[allow(dead_code)]

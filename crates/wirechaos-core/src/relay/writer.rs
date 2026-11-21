@@ -1,5 +1,5 @@
 use crate::relay::error::RelayError;
-use crate::relay::reader::{Frame, FrameBody};
+use crate::relay::reader::{Frame, FrameBody, StreamHeader};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 #[allow(dead_code)]
@@ -9,6 +9,26 @@ impl FrameWriter {
     #[allow(dead_code)]
     pub(crate) fn new() -> Self {
         Self {}
+    }
+
+    pub(crate) async fn write_header<W: AsyncWrite + Unpin>(
+        &mut self,
+        writer: &mut W,
+        header: &StreamHeader,
+    ) -> Result<(), RelayError> {
+        let declared_len = (header.body_len as u32).saturating_add(4);
+        let mut bytes = [0u8; 5];
+        bytes[0] = header.type_byte;
+        bytes[1..5].copy_from_slice(&declared_len.to_le_bytes());
+        writer.write_all(&bytes).await.map_err(RelayError::Io)
+    }
+
+    pub(crate) async fn write_body_chunk<W: AsyncWrite + Unpin>(
+        &mut self,
+        writer: &mut W,
+        chunk: &[u8],
+    ) -> Result<(), RelayError> {
+        writer.write_all(chunk).await.map_err(RelayError::Io)
     }
 
     pub(crate) async fn write_frame<W: AsyncWrite + Unpin>(

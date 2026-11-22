@@ -11,6 +11,7 @@ mod reader;
 mod sessions;
 mod state;
 mod writer;
+mod degrade;
 
 #[allow(unused_imports)]
 pub(crate) use config::{RelayConfig, RelayConfigError};

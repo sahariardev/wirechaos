@@ -12,6 +12,7 @@ mod sessions;
 mod state;
 mod writer;
 mod degrade;
+mod budget;
 
 #[allow(unused_imports)]
 pub(crate) use config::{RelayConfig, RelayConfigError};

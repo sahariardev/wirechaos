@@ -1,9 +1,10 @@
 use crate::proxy::buffer_pool::MultiBufferPool;
+use crate::relay::budget::InFlightBudget;
 use crate::relay::classification::Direction;
 use crate::relay::config::RelayConfig;
 use crate::relay::error::{RelayError, TeardownReason};
 use crate::relay::raw_pump::{copy_direction, RawStop, ShutdownSignal};
-use crate::relay::reader::{FrameRead, FrameReader};
+use crate::relay::reader::{Frame, FrameRead, FrameReader};
 use crate::relay::state::SessionState;
 use crate::relay::writer::FrameWriter;
 use crate::relay::{decide_mode, EpochWatcher, ModePlan, PumpOutcome, SessionFilters};
@@ -50,6 +51,8 @@ pub(crate) struct RelaySession {
     pub(crate) epoch: EpochWatcher,
     pub(crate) mode: Mode,
     pub(crate) raw_in_flight: bool,
+    pub(crate) frontend_budget: InFlightBudget,
+    pub(crate) backend_budget: InFlightBudget,
 
     pub(crate) shutdown: ShutdownSignal,
 }
@@ -71,6 +74,7 @@ impl RelaySession {
     ) -> Self {
         let max_message_size = config.max_message_size;
         let pool_max_bucket = config.pool_max_bucket;
+        let max_inflight_bytes = config.max_inflight_bytes;
         Self {
             frontend_read,
             frontend_write,
@@ -98,6 +102,8 @@ impl RelaySession {
             chaos_enabled,
             mode: Mode::Raw,
             raw_in_flight: false,
+            frontend_budget: InFlightBudget::new(max_inflight_bytes),
+            backend_budget: InFlightBudget::new(max_inflight_bytes),
         }
     }
 
@@ -111,6 +117,26 @@ impl RelaySession {
 
     pub(crate) fn raw_quiescent(&self) -> bool {
         !self.raw_in_flight
+    }
+
+    pub(crate) fn duplicate_frame(
+        &mut self,
+        direction: Direction,
+        frame: &Frame,
+    ) -> Result<(), RelayError> {
+        let bytes = 5 + frame.header.body_len;
+        let budget = match direction {
+            Direction::FrontendToBackend => &self.frontend_budget,
+            Direction::BackendToFrontend => &self.backend_budget,
+        };
+
+        let reservation = budget.reserve(bytes).map_err(|error| RelayError::Protocol {
+            code: "XX000",
+            message: error.to_string(),
+        })?;
+
+        drop(reservation);
+        Ok(())
     }
 }
 

@@ -3,6 +3,7 @@ use crate::relay::budget::InFlightBudget;
 use crate::relay::classification::Direction;
 use crate::relay::config::RelayConfig;
 use crate::relay::error::{RelayError, TeardownReason};
+use crate::relay::hook::{NoopHooks, RelayHooks};
 use crate::relay::raw_pump::{copy_direction, RawStop, ShutdownSignal};
 use crate::relay::reader::{Frame, FrameRead, FrameReader};
 use crate::relay::state::SessionState;
@@ -53,6 +54,7 @@ pub(crate) struct RelaySession {
     pub(crate) raw_in_flight: bool,
     pub(crate) frontend_budget: InFlightBudget,
     pub(crate) backend_budget: InFlightBudget,
+    pub(crate) hooks: Box<dyn RelayHooks>,
 
     pub(crate) shutdown: ShutdownSignal,
 }
@@ -104,6 +106,7 @@ impl RelaySession {
             raw_in_flight: false,
             frontend_budget: InFlightBudget::new(max_inflight_bytes),
             backend_budget: InFlightBudget::new(max_inflight_bytes),
+            hooks: Box::new(NoopHooks),
         }
     }
 
@@ -130,13 +133,19 @@ impl RelaySession {
             Direction::BackendToFrontend => &self.backend_budget,
         };
 
-        let reservation = budget.reserve(bytes).map_err(|error| RelayError::Protocol {
-            code: "XX000",
-            message: error.to_string(),
-        })?;
+        let reservation = budget
+            .reserve(bytes)
+            .map_err(|error| RelayError::Protocol {
+                code: "XX000",
+                message: error.to_string(),
+            })?;
 
         drop(reservation);
         Ok(())
+    }
+
+    pub(crate) fn with_hooks(&mut self, hooks: Box<dyn RelayHooks>) {
+        self.hooks = hooks;
     }
 }
 

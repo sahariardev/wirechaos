@@ -13,6 +13,7 @@ mod state;
 mod writer;
 mod degrade;
 mod budget;
+mod hook;
 
 #[allow(unused_imports)]
 pub(crate) use config::{RelayConfig, RelayConfigError};

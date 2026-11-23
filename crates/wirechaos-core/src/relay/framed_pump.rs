@@ -1,6 +1,8 @@
 use crate::relay::classification::{classify, Direction, MessageKind};
+use crate::relay::degrade::BodyAccess;
 use crate::relay::error::{RelayError, TeardownReason};
 use crate::relay::header::FrameHeader;
+use crate::relay::hook::{FrameContext, HookDecision};
 use crate::relay::reader::{Frame, FrameBody, FrameRead, StreamHeader};
 use crate::relay::sessions::RelaySession;
 
@@ -45,8 +47,60 @@ impl RelaySession {
     ) -> Result<PumpOutcome, RelayError> {
         let info = classify(direction, frame.header.type_byte);
         self.state.observe(&info, &frame)?;
-        let flush_now = matches!(info.kind, MessageKind::Flush | MessageKind::Terminate);
 
+        let ctx = FrameContext {
+            direction,
+            info,
+            mode: self.mode,
+            phase: self.state.phase.phase(),
+            txn: self.state.txn,
+            copy: self.state.copy,
+            pending: self.state.pending_count(),
+            body_access: BodyAccess::Complete,
+            last_query: self.state.last_query(),
+        };
+
+        let flush_now = matches!(info.kind, MessageKind::Flush | MessageKind::Terminate);
+        let decision = self.hooks.on_frame(&ctx, &frame)?;
+
+        match decision {
+            HookDecision::Pass => {
+                self.write_frame(direction, &frame, flush_now).await?;
+            }
+            HookDecision::Forward { delay } => {
+                if let Some(delay) = delay {
+                    tokio::time::sleep(delay).await;
+                }
+                self.write_frame(direction, &frame, flush_now).await?;
+            }
+            HookDecision::Emit { frames } => {
+                for replacement in frames {
+                    let replacement_kind = classify(direction, replacement.header.type_byte);
+                    let replacement_flush = matches!(
+                        replacement_kind.kind,
+                        MessageKind::Flush | MessageKind::Terminate
+                    );
+
+                    self.write_frame(direction, &replacement, flush_now || replacement_flush)
+                        .await?;
+                }
+            }
+            HookDecision::SuppressResponse => {}
+            HookDecision::Drop => {}
+            HookDecision::Terminate => {
+                return Ok(PumpOutcome::Stop(TeardownReason::ChaosTerminate))
+            }
+        }
+
+        Ok(PumpOutcome::Continue)
+    }
+
+    async fn write_frame(
+        &mut self,
+        direction: Direction,
+        frame: &Frame,
+        flush_now: bool,
+    ) -> Result<(), RelayError> {
         match direction {
             Direction::FrontendToBackend => {
                 self.backend_writer
@@ -66,7 +120,7 @@ impl RelaySession {
             }
         }
 
-        Ok(PumpOutcome::Continue)
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -86,9 +140,85 @@ impl RelaySession {
         };
 
         self.state.observe(&info, &header_frame)?;
+        let ctx = FrameContext {
+            direction,
+            info,
+            mode: self.mode,
+            phase: self.state.phase.phase(),
+            txn: self.state.txn,
+            copy: self.state.copy,
+            pending: self.state.pending_count(),
+            body_access: BodyAccess::Complete,
+            last_query: self.state.last_query(),
+        };
 
         let mut remaining = header.body_len;
+        let decision = self.hooks.on_frame(&ctx, &header_frame)?;
 
+        match decision {
+            HookDecision::Pass => self.stream_original(direction, header).await,
+            HookDecision::Forward { delay } => {
+                if let Some(delay) = delay {
+                    tokio::time::sleep(delay).await;
+                }
+
+                self.stream_original(direction, header).await
+            }
+            HookDecision::Drop => {
+                self.drain_stream(direction, header.body_len).await?;
+                Ok(PumpOutcome::Continue)
+            }
+            HookDecision::Terminate => Ok(PumpOutcome::Stop(TeardownReason::ChaosTerminate)),
+            HookDecision::Emit { .. } => Err(RelayError::Protocol {
+                code: "0A000",
+                message: "cannot emit a replacement for a streamed body".to_owned(),
+            }),
+            HookDecision::SuppressResponse => {
+                //todo
+                Err(RelayError::Protocol {
+                    code: "XX000",
+                    message: "SuppressResponse is only valid for backend frames".to_owned(),
+                })
+            }
+        }
+    }
+
+    async fn drain_stream(
+        &mut self,
+        direction: Direction,
+        mut remaining: usize,
+    ) -> Result<(), RelayError> {
+        while remaining > 0 {
+            let chunk = match direction {
+                Direction::FrontendToBackend => {
+                    self.frontend_reader
+                        .read_body_chunk(&mut self.frontend_read, remaining)
+                        .await?
+                }
+                Direction::BackendToFrontend => {
+                    self.backend_reader
+                        .read_body_chunk(&mut self.backend_read, remaining)
+                        .await?
+                }
+            };
+
+            remaining -= chunk.len();
+        }
+
+        match direction {
+            Direction::FrontendToBackend => self.frontend_reader.finish_stream(),
+            Direction::BackendToFrontend => self.backend_reader.finish_stream(),
+        }
+
+        Ok(())
+    }
+
+    async fn stream_original(
+        &mut self,
+        direction: Direction,
+        header: StreamHeader,
+    ) -> Result<PumpOutcome, RelayError> {
+        let mut remaining = header.body_len;
         match direction {
             Direction::FrontendToBackend => {
                 self.backend_writer

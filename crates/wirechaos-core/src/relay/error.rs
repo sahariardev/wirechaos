@@ -4,6 +4,7 @@ use std::fmt;
 #[allow(dead_code)]
 pub(crate) enum TeardownReason {
     Unknown,
+    ChaosTerminate
 }
 
 #[derive(Debug)]

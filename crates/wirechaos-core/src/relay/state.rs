@@ -44,7 +44,7 @@ impl SessionState {
             capture: QueryCapture::new(false, 0),
         }
     }
-    
+
     #[allow(dead_code)]
     #[must_use]
     pub(crate) fn with_config(config: &RelayConfig) -> Self {
@@ -53,7 +53,7 @@ impl SessionState {
             QueryCapture::new(config.capture_query_text, config.max_captured_query_bytes);
         state
     }
-    
+
     #[allow(dead_code)]
     pub(crate) fn observe(&mut self, info: &MessageInfo, frame: &Frame) -> Result<(), RelayError> {
         self.phase.observe(info);
@@ -95,7 +95,7 @@ impl SessionState {
             (MessageKind::CopyData, _) if self.copy == CopyMode::None => {}
             _ => {}
         }
-        
+
         match info.direction {
             Direction::FrontendToBackend => {
                 self.pending.observe_frontend(info.kind);
@@ -107,6 +107,14 @@ impl SessionState {
         }
 
         Ok(())
+    }
+
+    pub(crate) fn pending_count(&self) -> u32 {
+        self.pending.pending()
+    }
+
+    pub(crate) fn last_query(&self) -> Option<&crate::relay::capture::CapturedQuery> {
+        self.capture.last()
     }
 }
 

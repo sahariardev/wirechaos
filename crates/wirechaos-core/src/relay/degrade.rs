@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BodyAccess {
     Complete,
@@ -65,5 +66,71 @@ pub(crate) fn degrade(
         BodyAccess::Unavailable => Degradation::Refused {
             reason: "body is unavailable and the action requires it",
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_body_action_on_streamed_frame_degrades() {
+        let decision = degrade(
+            ActionRequirement::WholeBody,
+            BodyAccess::Streamed,
+            ActionKind::Replace,
+        );
+        assert!(matches!(decision, Degradation::Refused { .. }));
+    }
+
+    #[test]
+    fn replace_and_duplicate_are_refused_on_streams() {
+        for action in [
+            ActionKind::Replace,
+            ActionKind::Duplicate,
+            ActionKind::Truncate,
+            ActionKind::InspectValue,
+        ] {
+            assert!(matches!(
+                degrade(ActionRequirement::WholeBody, BodyAccess::Streamed, action),
+                Degradation::Refused { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn delay_drop_and_terminate_are_allowed_on_streams() {
+        for action in [
+            ActionKind::Delay,
+            ActionKind::DropFast,
+            ActionKind::Terminate,
+        ] {
+            assert_eq!(
+                degrade(ActionRequirement::FrameOnly, BodyAccess::Streamed, action),
+                Degradation::Allowed(action)
+            );
+        }
+    }
+
+    #[test]
+    fn complete_body_actions_are_unchanged() {
+        assert_eq!(
+            degrade(
+                ActionRequirement::WholeBody,
+                BodyAccess::Complete,
+                ActionKind::Replace
+            ),
+            Degradation::Allowed(ActionKind::Replace)
+        );
+    }
+
+    #[test]
+    fn unavailable_body_refuses_whole_body_actions() {
+        let decision = degrade(
+            ActionRequirement::WholeBody,
+            BodyAccess::Unavailable,
+            ActionKind::Duplicate,
+        );
+        assert!(matches!(decision, Degradation::Refused { .. }));
     }
 }

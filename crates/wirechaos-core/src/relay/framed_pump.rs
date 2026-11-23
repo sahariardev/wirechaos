@@ -1,10 +1,11 @@
 use crate::relay::classification::{classify, Direction, MessageKind};
 use crate::relay::degrade::BodyAccess;
 use crate::relay::error::{RelayError, TeardownReason};
-use crate::relay::header::FrameHeader;
+use crate::relay::header::{FrameHeader, ReadPath};
 use crate::relay::hook::{FrameContext, HookDecision};
 use crate::relay::reader::{Frame, FrameBody, FrameRead, StreamHeader};
 use crate::relay::sessions::RelaySession;
+use crate::relay::suppression::SuppressionAction;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -34,8 +35,20 @@ impl RelaySession {
 
         match frame {
             None => Ok(PumpOutcome::Stop(TeardownReason::Unknown)),
-            Some(FrameRead::Complete(frame)) => self.forward_one(direction, frame).await,
-            Some(FrameRead::Stream(header)) => self.forward_stream(direction, header).await,
+            Some(FrameRead::Complete(frame)) => {
+                let read_path = if frame.header.body_len == 0 {
+                    ReadPath::HeaderOnly
+                } else {
+                    ReadPath::Pooled
+                };
+                self.counters.observe_read_path(direction, read_path);
+                self.forward_one(direction, frame).await
+            }
+            Some(FrameRead::Stream(header)) => {
+                self.counters
+                    .observe_read_path(direction, ReadPath::Streamed);
+                self.forward_stream(direction, header).await
+            }
         }
     }
 
@@ -47,6 +60,14 @@ impl RelaySession {
     ) -> Result<PumpOutcome, RelayError> {
         let info = classify(direction, frame.header.type_byte);
         self.state.observe(&info, &frame)?;
+
+        // Suppression is checked before the hook: a hidden backend window is
+        // still observed for state, but no hook and no write see it.
+        if direction == Direction::BackendToFrontend
+            && self.suppression.observe_backend(&info) == SuppressionAction::Drop
+        {
+            return Ok(PumpOutcome::Continue);
+        }
 
         let ctx = FrameContext {
             direction,
@@ -85,7 +106,17 @@ impl RelaySession {
                         .await?;
                 }
             }
-            HookDecision::SuppressResponse => {}
+            HookDecision::SuppressResponse => {
+                if direction == Direction::FrontendToBackend {
+                    self.suppression.arm();
+                    self.write_frame(direction, &frame, flush_now).await?;
+                } else {
+                    return Err(RelayError::Protocol {
+                        code: "XX000",
+                        message: "SuppressResponse is only valid for frontend frames".to_owned(),
+                    });
+                }
+            }
             HookDecision::Drop => {}
             HookDecision::Terminate => {
                 return Ok(PumpOutcome::Stop(TeardownReason::ChaosTerminate))
@@ -104,7 +135,7 @@ impl RelaySession {
         match direction {
             Direction::FrontendToBackend => {
                 self.backend_writer
-                    .write_frame(&mut self.backend_write, &frame)
+                    .write_frame(&mut self.backend_write, frame)
                     .await?;
                 if flush_now {
                     self.backend_writer.flush(&mut self.backend_write).await?;
@@ -112,7 +143,7 @@ impl RelaySession {
             }
             Direction::BackendToFrontend => {
                 self.frontend_writer
-                    .write_frame(&mut self.frontend_write, &frame)
+                    .write_frame(&mut self.frontend_write, frame)
                     .await?;
                 if flush_now {
                     self.frontend_writer.flush(&mut self.frontend_write).await?;
@@ -120,6 +151,8 @@ impl RelaySession {
             }
         }
 
+        self.counters
+            .observe_written(direction, 5 + frame.header.body_len);
         Ok(())
     }
 
@@ -140,6 +173,16 @@ impl RelaySession {
         };
 
         self.state.observe(&info, &header_frame)?;
+
+        // A streamed backend frame still participates in suppression. Drain it
+        // so framing stays aligned, then write nothing.
+        if direction == Direction::BackendToFrontend
+            && self.suppression.observe_backend(&info) == SuppressionAction::Drop
+        {
+            self.drain_stream(direction, header.body_len).await?;
+            return Ok(PumpOutcome::Continue);
+        }
+
         let ctx = FrameContext {
             direction,
             info,
@@ -148,11 +191,10 @@ impl RelaySession {
             txn: self.state.txn,
             copy: self.state.copy,
             pending: self.state.pending_count(),
-            body_access: BodyAccess::Complete,
+            body_access: BodyAccess::Streamed,
             last_query: self.state.last_query(),
         };
 
-        let mut remaining = header.body_len;
         let decision = self.hooks.on_frame(&ctx, &header_frame)?;
 
         match decision {
@@ -174,11 +216,16 @@ impl RelaySession {
                 message: "cannot emit a replacement for a streamed body".to_owned(),
             }),
             HookDecision::SuppressResponse => {
-                //todo
-                Err(RelayError::Protocol {
-                    code: "XX000",
-                    message: "SuppressResponse is only valid for backend frames".to_owned(),
-                })
+                if direction == Direction::BackendToFrontend {
+                    self.suppression.arm();
+                    self.drain_stream(direction, header.body_len).await?;
+                    Ok(PumpOutcome::Continue)
+                } else {
+                    Err(RelayError::Protocol {
+                        code: "XX000",
+                        message: "SuppressResponse is only valid for backend frames".to_owned(),
+                    })
+                }
             }
         }
     }
@@ -263,6 +310,8 @@ impl RelaySession {
             }
         }
 
+        self.counters
+            .observe_written(direction, 5 + header.body_len);
         Ok(PumpOutcome::Continue)
     }
 }
@@ -273,6 +322,7 @@ mod tests {
     use crate::proxy::buffer_pool::MultiBufferPool;
     use crate::proxy::config::Config;
     use crate::relay::config::RelayConfig;
+    use crate::relay::hook::RelayHooks;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
@@ -312,7 +362,7 @@ mod tests {
         let (backend_write, server_read) = tokio::io::duplex(4096);
 
         let pool = MultiBufferPool::new(4, 64 * 1024, 2);
-        let session = RelaySession::new(
+        let session = RelaySession::for_test(
             Box::new(frontend_read),
             Box::new(frontend_write),
             Box::new(backend_read),
@@ -521,20 +571,132 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn framed_pump_returns_typed_errors_for_streams() {
+    async fn streamed_body_is_forwarded_in_chunks() {
         // 4-byte bucket forces an 8-byte body onto the streamed path.
         let config = relay_config(Some(
             "limits:\n  max_message_size: 1024\n  pool_max_bucket: 4\n  max_inflight_bytes: 16\n  capture_query_text: false\n  max_captured_query_bytes: 0\n",
         ));
         let mut h = harness_with_config(config);
+        let wire = msg(b'd', b"01234567");
+        h.client_write.write_all(&wire).await.expect("stream frame");
 
-        h.client_write
-            .write_all(&msg(b'd', b"01234567"))
+        assert_eq!(
+            h.session.pump_one(F2B).await.expect("streaming"),
+            PumpOutcome::Continue
+        );
+
+        let mut got = vec![0u8; wire.len()];
+        h.server_read
+            .read_exact(&mut got)
             .await
-            .expect("stream frame");
+            .expect("streamed bytes");
+        assert_eq!(got, wire);
+    }
 
-        let err = h.session.pump_one(F2B).await.expect_err("streaming");
-        assert!(matches!(err, RelayError::Protocol { code: "0A000", .. }));
+    #[tokio::test]
+    async fn large_streamed_body_uses_bounded_chunks() {
+        let config = relay_config(Some(
+            "limits:\n  max_message_size: 4194304\n  pool_max_bucket: 4096\n  max_inflight_bytes: 8192\n  capture_query_text: false\n  max_captured_query_bytes: 0\n",
+        ));
+        let (frontend_read, mut client_write) = tokio::io::duplex(64 * 1024);
+        let (frontend_write, _client_read) = tokio::io::duplex(64 * 1024);
+        let (backend_read, _server_write) = tokio::io::duplex(64 * 1024);
+        let (backend_write, mut server_read) = tokio::io::duplex(64 * 1024);
+        let mut session = RelaySession::for_test(
+            Box::new(frontend_read),
+            Box::new(frontend_write),
+            Box::new(backend_read),
+            Box::new(backend_write),
+            config,
+            MultiBufferPool::new(4, 64 * 1024, 2),
+        );
+
+        let body = vec![0x5a_u8; 512 * 1024];
+        let wire = msg(b'd', &body);
+        let expected = wire.clone();
+        let pump = tokio::spawn(async move { session.pump_one(F2B).await });
+
+        let mut got = vec![0u8; expected.len()];
+        let write = async {
+            client_write.write_all(&wire).await.expect("large stream");
+            drop(client_write);
+        };
+        let read = async {
+            server_read
+                .read_exact(&mut got)
+                .await
+                .expect("streamed output");
+        };
+        tokio::join!(write, read);
+
+        let outcome = timeout(Duration::from_secs(5), pump)
+            .await
+            .expect("large stream finished")
+            .expect("task");
+        assert_eq!(outcome.expect("pump"), PumpOutcome::Continue);
+        assert_eq!(got, expected);
+    }
+
+    #[tokio::test]
+    async fn framing_violation_closes_with_typed_08p01() {
+        let mut h = harness();
+        h.client_write
+            .write_all(&[b'Q', 0, 0, 0, 2])
+            .await
+            .expect("bad header");
+
+        let err = h.session.pump_one(F2B).await.expect_err("bad length");
+        assert!(matches!(
+            err,
+            RelayError::InvalidMessageLength { length: 2 }
+        ));
+        assert_eq!(err.sqlstate(), Some("08P01"));
+    }
+
+    #[tokio::test]
+    async fn hostile_length_is_rejected_before_body_allocation() {
+        let mut h = harness();
+        let mut header = [0u8; 5];
+        header[0] = b'Q';
+        header[1..5].copy_from_slice(&u32::MAX.to_be_bytes());
+        h.client_write.write_all(&header).await.expect("hostile");
+
+        let err = h.session.pump_one(F2B).await.expect_err("too large");
+        assert!(matches!(err, RelayError::MessageTooLarge { .. }));
+    }
+
+    #[tokio::test]
+    async fn hook_is_invoked_once_per_message() {
+        struct CountingHooks(Arc<AtomicUsize>);
+        impl RelayHooks for CountingHooks {
+            fn on_frame(
+                &mut self,
+                _ctx: &FrameContext<'_>,
+                _frame: &Frame,
+            ) -> Result<HookDecision, RelayError> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(HookDecision::Pass)
+            }
+        }
+
+        let mut h = harness();
+        let calls = Arc::new(AtomicUsize::new(0));
+        h.session
+            .with_hooks(Box::new(CountingHooks(Arc::clone(&calls))));
+
+        let mut wire = msg(b'Q', b"one\0");
+        wire.extend_from_slice(&msg(b'H', b""));
+        wire.extend_from_slice(&msg(b'Q', b"three\0"));
+        h.client_write.write_all(&wire).await.expect("burst");
+
+        for _ in 0..3 {
+            assert_eq!(
+                h.session.pump_one(F2B).await.expect("frame"),
+                PumpOutcome::Continue
+            );
+        }
+
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
     }
 
     struct TrackingWriter {
@@ -577,7 +739,7 @@ mod tests {
         let (backend_inner, _server_read) = tokio::io::duplex(4096);
         let flushes = Arc::new(AtomicUsize::new(0));
 
-        let mut session = RelaySession::new(
+        let mut session = RelaySession::for_test(
             Box::new(frontend_read),
             Box::new(frontend_write),
             Box::new(backend_read),

@@ -40,7 +40,6 @@ where
             return Ok(RawStop::Shutdown);
         }
 
-
         let n = tokio::select! {
             biased;
 
@@ -71,7 +70,7 @@ mod tests {
     use super::*;
     use std::io::{Error as IoError, ErrorKind};
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Poll};
     use tokio::time::{timeout, Duration};
 
@@ -160,6 +159,75 @@ mod tests {
 
         assert_eq!(stop, RawStop::Shutdown);
         assert_eq!(&first, b"abc");
+    }
+
+    #[tokio::test]
+    async fn relay_stops_reading_while_peer_write_blocks() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mut reader = CountingReader {
+            data: vec![7u8; 32],
+            pos: 0,
+            reads: Arc::clone(&reads),
+        };
+        let mut writer = BlockingWriter;
+        let (_tx, mut shutdown) = tokio::sync::watch::channel(false);
+
+        let result = timeout(
+            Duration::from_millis(50),
+            copy_direction(&mut reader, &mut writer, &mut shutdown, pool(), 8),
+        )
+        .await;
+
+        assert!(result.is_err(), "the blocked write must not finish");
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "the relay read ahead of a blocked write"
+        );
+    }
+
+    struct CountingReader {
+        data: Vec<u8>,
+        pos: usize,
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl AsyncRead for CountingReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let me = self.get_mut();
+            if me.pos >= me.data.len() {
+                return Poll::Pending;
+            }
+            me.reads.fetch_add(1, Ordering::SeqCst);
+            let n = buf.remaining().min(me.data.len() - me.pos).min(8);
+            buf.put_slice(&me.data[me.pos..me.pos + n]);
+            me.pos += n;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct BlockingWriter;
+
+    impl AsyncWrite for BlockingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
     }
 
     struct TrackingWriter {

@@ -18,6 +18,7 @@ pub(crate) struct FrameContext<'a> {
     pub(crate) last_query: Option<&'a CapturedQuery>,
 }
 
+#[allow(dead_code)]
 pub(crate) enum HookDecision {
     Pass,
     Forward { delay: Option<Duration> },
@@ -40,8 +41,8 @@ pub(crate) struct NoopHooks;
 impl RelayHooks for NoopHooks {
     fn on_frame(
         &mut self,
-        ctx: &FrameContext<'_>,
-        frame: &Frame,
+        _ctx: &FrameContext<'_>,
+        _frame: &Frame,
     ) -> Result<HookDecision, RelayError> {
         Ok(HookDecision::Pass)
     }

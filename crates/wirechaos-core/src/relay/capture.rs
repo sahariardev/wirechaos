@@ -33,7 +33,7 @@ impl QueryCapture {
             self.last = None;
             return;
         }
-        
+
         if info.direction != Direction::FrontendToBackend {
             return;
         }
@@ -48,7 +48,7 @@ impl QueryCapture {
         let truncated = sql.len() > cap;
         let take = sql.len().min(cap);
         let mut text = String::from_utf8_lossy(&sql[..take]).into_owned();
-        
+
         if text.len() > cap {
             let mut end = cap;
             while end > 0 && !text.is_char_boundary(end) {

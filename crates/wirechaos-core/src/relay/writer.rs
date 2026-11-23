@@ -19,7 +19,7 @@ impl FrameWriter {
         let declared_len = (header.body_len as u32).saturating_add(4);
         let mut bytes = [0u8; 5];
         bytes[0] = header.type_byte;
-        bytes[1..5].copy_from_slice(&declared_len.to_le_bytes());
+        bytes[1..5].copy_from_slice(&declared_len.to_be_bytes());
         writer.write_all(&bytes).await.map_err(RelayError::Io)
     }
 

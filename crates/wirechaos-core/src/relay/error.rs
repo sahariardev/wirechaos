@@ -1,10 +1,44 @@
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum TeardownReason {
+    #[default]
     Unknown,
-    ChaosTerminate
+    ClientTerminate,
+    ClientEof,
+    ClientReset,
+    BackendEof,
+    BackendEofWhileWaiting,
+    FramingViolation,
+    ChaosTerminate,
+    AdminKill,
+    IdleTimeout,
+    Panic,
+}
+
+impl TeardownReason {
+    pub(crate) fn trigger(self) -> crate::relay::teardown::TeardownTrigger {
+        use crate::relay::teardown::TeardownTrigger;
+        match self {
+            Self::Unknown | Self::Panic => TeardownTrigger::Panic,
+            Self::ClientTerminate => TeardownTrigger::ClientTerminate,
+            Self::ClientEof => TeardownTrigger::ClientEof,
+            Self::ClientReset => TeardownTrigger::ClientReset,
+            Self::BackendEof => TeardownTrigger::BackendEof {
+                response_pending: false,
+            },
+            Self::BackendEofWhileWaiting => TeardownTrigger::BackendEof {
+                response_pending: true,
+            },
+            Self::FramingViolation => TeardownTrigger::FramingViolation,
+            Self::ChaosTerminate => TeardownTrigger::ChaosTerminate {
+                send_error: true,
+                orderly: false,
+            },
+            Self::AdminKill => TeardownTrigger::AdminKill,
+            Self::IdleTimeout => TeardownTrigger::IdleTimeout,
+        }
+    }
 }
 
 #[derive(Debug)]

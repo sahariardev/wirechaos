@@ -15,7 +15,46 @@
 use bytes::BytesMut;
 use std::mem;
 use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+/// Test/observability counters for the pool. They do not change pool semantics.
+pub struct PoolMetrics {
+    rented: AtomicUsize,
+    high_water: AtomicUsize,
+}
+
+impl PoolMetrics {
+    fn on_rent(&self) {
+        let now = self.rented.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut peak = self.high_water.load(Ordering::Relaxed);
+        while now > peak {
+            match self.high_water.compare_exchange_weak(
+                peak,
+                now,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => peak = observed,
+            }
+        }
+    }
+
+    fn on_return(&self) {
+        self.rented.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn rented(&self) -> usize {
+        self.rented.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn high_water(&self) -> usize {
+        self.high_water.load(Ordering::Relaxed)
+    }
+}
 
 /// A buffer rented from a [`MultiBufferPool`].
 ///
@@ -26,6 +65,7 @@ pub struct PooledBytes {
     original_capacity: usize,
     bucket_index: usize,
     pool: Arc<MultiBufferPool>,
+    metrics: Arc<PoolMetrics>,
 }
 
 impl PooledBytes {
@@ -65,6 +105,7 @@ impl Drop for PooledBytes {
 
         let buf = mem::take(&mut self.buf);
         self.pool.return_buffer(self.bucket_index, buf);
+        self.metrics.on_return();
     }
 }
 
@@ -92,6 +133,7 @@ impl BufferBucket {
 /// `max_len` inclusive.
 pub struct MultiBufferPool {
     buckets: Vec<BufferBucket>,
+    metrics: Arc<PoolMetrics>,
 }
 
 impl MultiBufferPool {
@@ -113,7 +155,17 @@ impl MultiBufferPool {
             current_size *= 2;
         }
 
-        Arc::new(Self { buckets })
+        Arc::new(Self {
+            buckets,
+            metrics: Arc::new(PoolMetrics {
+                rented: AtomicUsize::new(0),
+                high_water: AtomicUsize::new(0),
+            }),
+        })
+    }
+
+    pub fn metrics(&self) -> Arc<PoolMetrics> {
+        Arc::clone(&self.metrics)
     }
 
     /// Rent a buffer that can hold at least `requested_size` bytes.
@@ -158,11 +210,13 @@ impl MultiBufferPool {
             buf.set_len(requested_size);
         }
 
+        self.metrics.on_rent();
         PooledBytes {
             buf,
             original_capacity: bucket.capacity,
             bucket_index,
             pool: Arc::clone(self),
+            metrics: Arc::clone(&self.metrics),
         }
     }
 
@@ -232,5 +286,22 @@ mod tests {
         // The pool must still serve buffers rather than failing every later session.
         let buf = pool.get(4);
         assert_eq!(buf.len(), 4);
+    }
+
+    #[test]
+    fn metrics_track_rent_and_return() {
+        let pool = MultiBufferPool::new(4, 64, 1);
+        assert_eq!(pool.metrics().rented(), 0);
+
+        let first = pool.get(8);
+        let second = pool.get(9);
+        assert_eq!(pool.metrics().rented(), 2);
+        assert_eq!(pool.metrics().high_water(), 2);
+
+        drop(first);
+        assert_eq!(pool.metrics().rented(), 1);
+        drop(second);
+        assert_eq!(pool.metrics().rented(), 0);
+        assert_eq!(pool.metrics().high_water(), 2);
     }
 }

@@ -45,4 +45,10 @@ impl TimeoutStream {
             .map_err(|_| PgError::StartupTimeout)??;
         Ok(())
     }
+
+    /// Hand the post-startup stream to the relay. The startup timeout no longer
+    /// applies: the relay owns its own deadlines and backpressure.
+    pub fn into_parts(self) -> (BufReader<ConnRead>, BufWriter<ConnWrite>) {
+        (self.buffer_reader, self.buffer_writer)
+    }
 }

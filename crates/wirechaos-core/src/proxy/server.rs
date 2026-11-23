@@ -26,11 +26,6 @@ pub struct ServerConfig {
 
 pub struct ServerState {
     config: Arc<Config>,
-    // 6.1: built once at startup (spec §7.3), passed to Conn in 6.13.
-    #[allow(
-        dead_code,
-        reason = "consumed by Conn in 6.13 when Conn::handle wires relay::run"
-    )]
     relay_config: Arc<RelayConfig>,
     credentials: Arc<CredentialStore>,
     frontend_tls: Option<FrontendTls>,
@@ -94,9 +89,7 @@ pub async fn serve(listener: TcpListener, state: ServerState) -> anyhow::Result<
         let credentials = Arc::clone(&state.credentials);
         let frontend_tls = state.frontend_tls.clone();
         let config = Arc::clone(&state.config);
-        // 6.1: `relay_config` is held in `ServerState` for 6.13; `Conn` does
-        // not consume it until `Conn::handle` wires `relay::run`, so we do
-        // not clone it per-accept here yet.
+        let relay_config = Arc::clone(&state.relay_config);
 
         tokio::spawn(async move {
             let mut conn = Conn::new(
@@ -109,6 +102,7 @@ pub async fn serve(listener: TcpListener, state: ServerState) -> anyhow::Result<
                 connections,
                 config,
             );
+            conn.set_relay_config(relay_config);
 
             if let Err(error) = conn.handle().await {
                 // A server-side fault: one session fails, the listener lives on.

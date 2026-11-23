@@ -10,7 +10,7 @@ use crate::proxy::backend::pg_client::PgClient;
 pub use crate::proxy::backend::pg_client::PgConfig;
 use crate::proxy::buffer_pool::MultiBufferPool;
 use crate::proxy::conn::CANCEL_REQUEST_CODE;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -46,7 +46,7 @@ pub struct Backend {
         dead_code,
         reason = "held for the session lifetime; dropping it closes the backend connection"
     )]
-    client: PgClient,
+    client: Mutex<Option<PgClient>>,
     #[allow(
         dead_code,
         reason = "held alongside the client so the pool outlives every rented buffer"
@@ -115,6 +115,26 @@ impl Backend {
         Ok(())
     }
 
+    /// Take the post-startup backend I/O for the relay.
+    ///
+    /// The registry may still hold an `Arc<Backend>` for cancel routing, so the
+    /// client lives in a `Mutex<Option<_>>`; the first caller takes it and all
+    /// later calls return `None`.
+    pub async fn take_relay_io(
+        &self,
+    ) -> Option<(
+        tokio::io::BufReader<crate::proxy::conn_read::ConnRead>,
+        crate::proxy::conn_write::ConnWrite,
+    )> {
+        let client = {
+            let mut guard = self.client.lock().ok()?;
+            guard.take()?
+        };
+        let (reader, mut writer) = client.into_parts();
+        let _ = writer.flush().await;
+        Some((reader, writer.into_inner()))
+    }
+
     pub async fn new(config: PgConfig, pool: Arc<MultiBufferPool>) -> Result<Arc<Self>, PgError> {
         let mut client = PgClient::connect(config, Arc::clone(&pool)).await?;
 
@@ -126,7 +146,7 @@ impl Backend {
             host: client.host().to_owned(),
             port: client.port(),
             connect_timeout: client.connect_timeout(),
-            client,
+            client: Mutex::new(Some(client)),
             pool,
         };
 
@@ -136,7 +156,7 @@ impl Backend {
     #[cfg(test)]
     pub(crate) fn for_test() -> Self {
         Self {
-            client: PgClient::for_test(),
+            client: Mutex::new(Some(PgClient::for_test())),
             pool: MultiBufferPool::new(16, 16, 0),
             startup_notifications: Vec::new(),
             backend_key: None,
@@ -367,7 +387,7 @@ mod tests {
             host: String::new(),
             port: 0,
             connect_timeout: Duration::from_secs(1),
-            client: PgClient::for_test(),
+            client: Mutex::new(Some(PgClient::for_test())),
             pool: MultiBufferPool::new(16, 16, 0),
         };
 

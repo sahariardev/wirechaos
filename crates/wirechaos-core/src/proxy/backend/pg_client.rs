@@ -171,6 +171,17 @@ impl PgClient {
         self.connect_timeout
     }
 
+    /// Take the post-startup stream for the relay. This consumes the client:
+    /// the relay becomes the sole owner of the four I/O handles.
+    pub fn into_parts(
+        self,
+    ) -> (
+        tokio::io::BufReader<crate::proxy::conn_read::ConnRead>,
+        tokio::io::BufWriter<crate::proxy::conn_write::ConnWrite>,
+    ) {
+        self.stream.into_parts()
+    }
+
     async fn handle_startup_handshake(&mut self, config: &PgConfig) -> Result<(), PgError> {
         loop {
             let (tag, payload_len) = self.read_message_header().await?;

@@ -16,9 +16,12 @@ use crate::proxy::replication_mode::ReplicationMode;
 use crate::proxy::startup_config_parse_util::{parse_options, parse_replication_mode};
 use crate::proxy::tls::FrontendTls;
 use crate::proxy::InternalError;
+use crate::relay::{EpochWatcher, NoChaosPlan, RelayConfig, RelaySession, SessionFilters};
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter, ReadBuf};
 use tokio::net::TcpStream;
 
 pub struct Conn<V: VerifierProvider> {
@@ -44,6 +47,8 @@ pub struct Conn<V: VerifierProvider> {
     pub server_signature_verified: bool,
     pub conn_registry: ConnRegistry,
     pub config: Arc<Config>,
+    /// Validated once at startup and shared by every session.
+    relay_config: Option<Arc<RelayConfig>>,
     /// Kept alive for the session's lifetime so the registry entry — and with it
     /// the cancel key — exists exactly as long as the session does.
     session_guard: Option<SessionGuard>,
@@ -110,8 +115,13 @@ impl<V: VerifierProvider> Conn<V> {
             server_signature_verified: false,
             conn_registry,
             config,
+            relay_config: None,
             session_guard: None,
         }
+    }
+
+    pub(crate) fn set_relay_config(&mut self, relay_config: Arc<RelayConfig>) {
+        self.relay_config = Some(relay_config);
     }
 
     /// Drive the connection after the startup phase.
@@ -120,7 +130,7 @@ impl<V: VerifierProvider> Conn<V> {
     /// deliberate and tracked there — the lint stays active for new code, while this
     /// known gap is visible rather than hidden.
     pub async fn handle(&mut self) -> Result<(), InternalError> {
-        let Some(_permit) = self.conn_registry.try_acquire() else {
+        let Some(permit) = self.conn_registry.try_acquire() else {
             self.send_error_message(TooManyRequest.code(), TooManyRequest.message())
                 .await?;
             return Ok(());
@@ -138,8 +148,76 @@ impl<V: VerifierProvider> Conn<V> {
             }
         }
 
-        //todo::relay
-        Ok(())
+        self.run_relay(permit).await
+    }
+
+    /// Build the relay session after startup/auth and hand it the four handles.
+    async fn run_relay(
+        &mut self,
+        permit: crate::proxy::conn_registry::ConnPermit,
+    ) -> Result<(), InternalError> {
+        let backend = self
+            .backend
+            .clone()
+            .ok_or_else(|| InternalError::from("backend link is missing after startup"))?;
+        let (backend_read, backend_write) = backend
+            .take_relay_io()
+            .await
+            .ok_or_else(|| InternalError::from("backend relay I/O already taken"))?;
+
+        let (frontend_read, frontend_write) = self.take_frontend_io().await?;
+
+        let relay_config = match self.relay_config.clone() {
+            Some(config) => config,
+            None => Arc::new(
+                RelayConfig::from_config(&self.config)
+                    .map_err(|error| Box::new(error) as InternalError)?,
+            ),
+        };
+
+        let filters = SessionFilters {
+            user: self.user.clone(),
+            database: self.database.clone(),
+            application_name: self.params.get("application_name").cloned(),
+        };
+
+        let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+        let (_epoch_tx, epoch) = tokio::sync::watch::channel(0);
+        let mut session = RelaySession::new(
+            Box::new(frontend_read),
+            Box::new(frontend_write),
+            Box::new(backend_read),
+            Box::new(backend_write),
+            relay_config,
+            Arc::clone(&self.pool),
+            shutdown,
+            Arc::new(NoChaosPlan),
+            filters,
+            false,
+            EpochWatcher::new(epoch),
+        );
+        session.set_permit(permit);
+
+        crate::relay::run(session)
+            .await
+            .map(|_outcome| ())
+            .map_err(|error| Box::new(error) as InternalError)
+    }
+
+    async fn take_frontend_io(
+        &mut self,
+    ) -> Result<(PrefixedReader, crate::proxy::conn_write::ConnWrite), InternalError> {
+        let reader = std::mem::replace(&mut self.buffer_reader, BufReader::new(ConnRead::Empty));
+        let buffered = reader.buffer().to_vec();
+        let inner = reader.into_inner();
+
+        let mut writer = std::mem::replace(
+            &mut self.buffer_writer,
+            BufWriter::new(crate::proxy::conn_write::ConnWrite::Empty),
+        );
+        writer.flush().await?;
+
+        Ok((PrefixedReader::new(buffered, inner), writer.into_inner()))
     }
 
     async fn drive_startup_until_ready(&mut self) -> Result<(), InternalError> {
@@ -630,6 +708,43 @@ impl<V: VerifierProvider> Conn<V> {
             .await
             .map_err(ProxyError::internal)?;
         Ok(())
+    }
+}
+
+/// Presents bytes that `BufReader` had already buffered before the relay took
+/// over, then continues reading from the underlying transport.
+struct PrefixedReader {
+    prefix: Vec<u8>,
+    offset: usize,
+    inner: ConnRead,
+}
+
+impl PrefixedReader {
+    fn new(prefix: Vec<u8>, inner: ConnRead) -> Self {
+        Self {
+            prefix,
+            offset: 0,
+            inner,
+        }
+    }
+}
+
+impl AsyncRead for PrefixedReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let me = self.get_mut();
+        if me.offset < me.prefix.len() {
+            let remaining = &me.prefix[me.offset..];
+            let n = buf.remaining().min(remaining.len());
+            buf.put_slice(&remaining[..n]);
+            me.offset += n;
+            return Poll::Ready(Ok(()));
+        }
+
+        Pin::new(&mut me.inner).poll_read(cx, buf)
     }
 }
 

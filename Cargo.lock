@@ -845,6 +845,53 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "pgfault"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "pgfault-core",
+ "rpassword",
+ "tokio",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
+name = "pgfault-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "base64 0.23.1",
+ "bytes",
+ "hmac 0.12.1",
+ "md5",
+ "oid-registry",
+ "pbkdf2",
+ "rand 0.8.8",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_yaml",
+ "sha2 0.10.9",
+ "static_assertions",
+ "stringprep",
+ "subtle",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-postgres",
+ "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
+ "webpki-roots 0.26.11",
+ "x509-parser",
+ "zeroize",
+]
+
+[[package]]
 name = "phf"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1861,53 +1908,6 @@ name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
-
-[[package]]
-name = "wirechaos"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "rpassword",
- "tokio",
- "tracing",
- "wirechaos-core",
- "zeroize",
-]
-
-[[package]]
-name = "wirechaos-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arc-swap",
- "base64 0.23.1",
- "bytes",
- "hmac 0.12.1",
- "md5",
- "oid-registry",
- "pbkdf2",
- "rand 0.8.8",
- "rcgen",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_yaml",
- "sha2 0.10.9",
- "static_assertions",
- "stringprep",
- "subtle",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tokio-postgres",
- "tokio-rustls",
- "tracing",
- "tracing-subscriber",
- "webpki-roots 0.26.11",
- "x509-parser",
- "zeroize",
-]
 
 [[package]]
 name = "wit-bindgen"

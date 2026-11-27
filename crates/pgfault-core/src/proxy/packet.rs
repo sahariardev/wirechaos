@@ -1,0 +1,144 @@
+use crate::proxy::buffer_pool::PooledBytes;
+use crate::proxy::error::{connection_error, ConnectionErrorInner::*, ProxyError};
+use crate::proxy::InternalError;
+
+pub struct MessageReader {
+    buf: PooledBytes,
+    pos: usize,
+}
+
+impl MessageReader {
+    pub fn new(buf: PooledBytes) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.buf.len() - self.pos
+    }
+
+    /// Read a single byte from the body.
+    ///
+    /// Part of the typed message model: unused until the protocol engine reads
+    /// single-byte fields.
+    #[allow(dead_code)]
+    pub fn read_byte(&mut self) -> Result<u8, InternalError> {
+        if self.remaining() == 0 {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "Message body is empty",
+            )));
+        }
+
+        let byte = self.buf[self.pos];
+
+        self.pos += 1;
+
+        Ok(byte)
+    }
+
+    /// Read a big-endian `Int16` from the body.
+    ///
+    /// Part of the typed message model: unused until the protocol engine reads
+    /// `Int16` fields such as `RowDescription` column counts.
+    #[allow(dead_code)]
+    pub fn read_u16(&mut self) -> Result<u16, InternalError> {
+        if self.remaining() < 2 {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "Not enough bytes to read",
+            )));
+        }
+
+        let value = u16::from_be_bytes([self.buf[self.pos], self.buf[self.pos + 1]]);
+
+        self.pos += 2;
+
+        Ok(value)
+    }
+
+    pub fn read_u32(&mut self) -> Result<u32, ProxyError> {
+        if self.remaining() < 4 {
+            return Err(connection_error(InvalidMessageLength));
+        }
+
+        let value = u32::from_be_bytes([
+            self.buf[self.pos],
+            self.buf[self.pos + 1],
+            self.buf[self.pos + 2],
+            self.buf[self.pos + 3],
+        ]);
+
+        self.pos += 4;
+
+        Ok(value)
+    }
+
+    pub fn read_string(&mut self) -> Result<String, ProxyError> {
+        let start = self.pos;
+
+        while self.pos < self.buf.len() {
+            if self.buf[self.pos] == b'\0' {
+                let message = String::from_utf8(self.buf[start..self.pos].to_vec())
+                    .map_err(ProxyError::internal)?;
+                self.pos += 1;
+                return Ok(message);
+            }
+
+            self.pos += 1;
+        }
+
+        Err(connection_error(InvalidMessageLength))
+    }
+
+    pub fn read_string_fixed_size(&mut self, size: i32) -> Result<String, ProxyError> {
+        if self.remaining() < size as usize {
+            return Err(connection_error(InvalidMessageLength));
+        }
+
+        let start = self.pos;
+        let end = self.pos + size as usize;
+        self.pos = end;
+
+        let message =
+            String::from_utf8(self.buf[start..end].to_vec()).map_err(ProxyError::internal)?;
+        Ok(message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proxy::buffer_pool::MultiBufferPool;
+
+    /// A reader over exactly `bytes`, backed by a pool that can serve them.
+    fn reader_with(bytes: &[u8]) -> MessageReader {
+        let pool_size = bytes.len().next_power_of_two().max(4);
+        let pool = MultiBufferPool::new(pool_size, pool_size, 1);
+
+        let mut buf = pool.get(bytes.len());
+        buf.copy_from_slice(bytes);
+
+        MessageReader::new(buf)
+    }
+
+    #[test]
+    fn read_string_fixed_size_consumes_only_the_string() {
+        let mut reader = reader_with(b"abcd\x00\x00\x00\x01");
+
+        assert_eq!(reader.read_string_fixed_size(4).unwrap(), "abcd");
+        assert_eq!(
+            reader.remaining(),
+            4,
+            "the reader must stop right after the fixed-size string"
+        );
+        assert_eq!(reader.read_u32().unwrap(), 1);
+        assert_eq!(reader.remaining(), 0);
+    }
+
+    #[test]
+    fn read_string_fixed_size_rejects_a_short_buffer() {
+        let mut reader = reader_with(b"abcd");
+
+        assert!(reader.read_string_fixed_size(8).is_err());
+    }
+}

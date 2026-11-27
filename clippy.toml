@@ -1,4 +1,4 @@
-# Clippy configuration for the wirechaos workspace.
+# Clippy configuration for the pgfault workspace.
 #
 # Policy: production code must not panic on input it does not control. A proxy that
 # aborts the process because one client sent a malformed frame is a worse failure
@@ -20,7 +20,7 @@ allow-indexing-slicing-in-tests = true
 disallowed-methods = [
     # Blocking sleep inside a tokio task starves the executor's worker thread.
     # Use `tokio::time::sleep`, or `#[tokio::test(start_paused = true)]` when the
-    # test needs deterministic timing (see doc/tasks/11-performance-validation.md).
+    # test needs deterministic timing.
     { path = "std::thread::sleep", reason = "blocking sleep stalls the async runtime; use tokio::time::sleep" },
     # Exiting mid-flight skips RAII teardown: session deregistration, buffer return,
     # metrics flush. Return an error and let `main` decide the exit code.
@@ -30,7 +30,7 @@ disallowed-methods = [
     { path = "std::env::set_var", reason = "process-global mutation; thread configuration through the config types" },
     { path = "std::env::remove_var", reason = "process-global mutation; thread configuration through the config types" },
     # Blocking channels in async code deadlock the runtime. The relay uses bounded
-    # tokio channels for backpressure (doc/tasks/06-relay-engine.md).
+    # tokio channels for backpressure.
     { path = "std::sync::mpsc::channel", reason = "blocking channel in async code; use tokio::sync::mpsc" },
 ]
 

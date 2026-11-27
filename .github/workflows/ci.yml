@@ -3,9 +3,9 @@ name: ci
 # Gates, in increasing cost. Everything here must be green on `master`; a red gate is
 # a release blocker, not a warning to be ignored later.
 #
-# TODO(task 12): add the E2E matrix job (docker compose, PostgreSQL 14 + 18, auth and
+# TODO: add the E2E matrix job (docker compose, PostgreSQL 14 + 18, auth and
 # channel-binding matrix), the nightly performance gate, and the fuzz targets once
-# `tests/e2e/` and the benches exist. See doc/tasks/12-e2e-and-ci.md.
+# `tests/e2e/` and the benches exist.
 
 on:
   push:

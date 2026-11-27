@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/wirechaos",
-    "crates/wirechaos-core"
+    "crates/pgfault",
+    "crates/pgfault-core"
 ]
 
 [workspace.package]
@@ -10,7 +10,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["sahariardev<rifatsahariar@gmail.com>"]
 license = "MIT"
-repository = "https://github.com/sahariardev/wirechaos"
+repository = "https://github.com/sahariardev/pgfault"
 
 [workspace.dependencies]
 tokio = { version = "1.38", features = ["full"] }
@@ -42,7 +42,7 @@ unsafe_code = "warn"
 unused_must_use = "deny"
 rust_2018_idioms = { level = "warn", priority = -1 }
 non_ascii_idents = "deny"
-# `missing_docs` is deliberately deferred: tasks 13-16 reshape the public surface
+# `missing_docs` is deliberately deferred: later work reshapes the public surface
 # (message model, codecs, rule schema) and documenting it twice is wasted work.
 
 [workspace.lints.clippy]
@@ -53,8 +53,7 @@ correctness = { level = "deny", priority = -1 }
 suspicious = { level = "warn", priority = -1 }
 perf = { level = "warn", priority = -1 }
 style = { level = "warn", priority = -1 }
-# Panicking on data that came off the wire is a bug, not a shortcut: see the
-# error taxonomy in doc/tasks/01-scram_authenticator-sha-256.md and 04-startup-phase-completion.md.
+# Panicking on data that came off the wire is a bug, not a shortcut.
 unwrap_used = "deny"
 expect_used = "deny"
 panic_in_result_fn = "warn"

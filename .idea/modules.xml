@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/wirechaos.iml" filepath="$PROJECT_DIR$/.idea/wirechaos.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/pgfault.iml" filepath="$PROJECT_DIR$/.idea/pgfault.iml" />
     </modules>
   </component>
 </project>
